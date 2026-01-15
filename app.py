@@ -973,9 +973,6 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
         if not user_command or not user_command.strip():
             user_command = "Drive safely and follow traffic rules."
 
-        # Create camera grid visualization
-        vis_image = visualize_camera_grid(camera_images)
-
         degraded_flag = "YES" if meta.get("degraded") else "NO"
         notes = meta.get("notes", [])
         sample_id = meta.get('sample_id', 'unknown')
@@ -1012,6 +1009,14 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
             trajectory[:, 3] = 1.0
             trajectory[:, 7] = 1.0
             trajectory[:, 11] = 1.0
+
+        # Get front camera image for visualization
+        front_camera_image = None
+        if "front_wide" in camera_images and camera_images["front_wide"]:
+            front_camera_image = camera_images["front_wide"][0]
+
+        # Create trajectory visualization with front camera view
+        vis_image = visualize_trajectory(trajectory, front_camera_image)
 
         reasoning_output = f"""{mode_status}
 
