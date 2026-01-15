@@ -62,6 +62,10 @@ processor = None
 _attn_implementation = None
 _alpamayo_available = False
 
+# Sample pool for rotation (global state)
+_sample_pool: List[str] = []  # List of video files
+_sample_idx: int = 0  # Current index in pool
+
 
 # ========== Cache Management ==========
 def get_dir_size_gb(path: Path) -> float:
@@ -111,6 +115,125 @@ def get_cache_status() -> str:
     size_gb = get_dir_size_gb(CACHE_DIR)
     file_count = sum(1 for _ in CACHE_DIR.rglob("*") if _.is_file())
     return f"Cache: {size_gb:.2f}GB / {CACHE_LIMIT_GB}GB, {file_count} files"
+
+
+# ========== Input Validation ==========
+def validate_inputs(sample_bundle: Optional[Dict]) -> Tuple[bool, List[str]]:
+    """
+    Validate sample bundle for real inference.
+    Returns: (is_valid, missing_keys)
+
+    Required for real inference:
+    - ego_motion: actual vehicle motion history
+    - timestamps: precise frame timestamps
+    - calibration: camera intrinsics/extrinsics
+    - proper_sequence: temporally coherent frames
+    """
+    if sample_bundle is None:
+        return False, ["sample_bundle"]
+
+    missing_keys = []
+    meta = sample_bundle.get("meta", {})
+
+    # Check for ego_motion (real vehicle telemetry)
+    if "ego_motion" not in meta or meta.get("ego_motion") is None:
+        missing_keys.append("ego_motion")
+
+    # Check for precise timestamps
+    timestamps = meta.get("timestamps", [])
+    if not timestamps or timestamps == [i * 0.1 for i in range(FRAMES_PER_CAMERA)]:
+        missing_keys.append("timestamps (using placeholder)")
+
+    # Check for camera calibration
+    if "calibration" not in meta or meta.get("calibration") is None:
+        missing_keys.append("calibration")
+
+    # Check if data is degraded (placeholders used)
+    if meta.get("degraded", False):
+        missing_keys.append("proper_sequence (degraded input)")
+
+    is_valid = len(missing_keys) == 0
+    return is_valid, missing_keys
+
+
+def build_sample_pool(repo_id: str = SAMPLE_REPO_ID) -> List[str]:
+    """
+    Build a shuffled pool of video files for sample rotation.
+    Returns list of mp4 file paths from the dataset.
+    """
+    from huggingface_hub import HfApi
+    import random
+
+    api = HfApi()
+    try:
+        files = api.list_repo_files(repo_id, repo_type="dataset")
+    except Exception as e:
+        print(f"[POOL] Failed to list repo: {e}")
+        return []
+
+    # Get all mp4 files
+    mp4_files = [f for f in files if f.lower().endswith('.mp4')]
+
+    # Group by unique sample (using parent directory or first part of filename)
+    # Each "sample" is a set of 4 camera videos from the same scene
+    sample_groups: Dict[str, List[str]] = {}
+    for mp4 in mp4_files:
+        # Extract sample identifier (e.g., "clips/sample_001/front_wide.mp4" -> "sample_001")
+        parts = Path(mp4).parts
+        if len(parts) >= 2:
+            sample_key = parts[-2]  # Use parent directory as sample key
+        else:
+            sample_key = Path(mp4).stem.split('_')[0]  # Use first part of filename
+
+        if sample_key not in sample_groups:
+            sample_groups[sample_key] = []
+        sample_groups[sample_key].append(mp4)
+
+    # Get unique sample keys that have videos for all cameras
+    valid_samples = []
+    for key, videos in sample_groups.items():
+        # Check if this sample has at least one video per camera
+        has_all_cameras = True
+        for cam in CAMERAS:
+            if not any(cam in v.lower() for v in videos):
+                has_all_cameras = False
+                break
+        if has_all_cameras:
+            valid_samples.append(key)
+
+    # If no valid multi-camera samples, just use all mp4 files
+    if not valid_samples:
+        valid_samples = list(sample_groups.keys())
+
+    # Shuffle the samples
+    random.shuffle(valid_samples)
+
+    print(f"[POOL] Built sample pool with {len(valid_samples)} unique samples")
+    return valid_samples
+
+
+def get_next_sample_id() -> Tuple[str, int]:
+    """
+    Get the next sample ID from the pool, rotating through available samples.
+    Returns: (sample_id, index_in_pool)
+    """
+    global _sample_pool, _sample_idx
+
+    # Build pool if empty
+    if not _sample_pool:
+        _sample_pool = build_sample_pool()
+
+    if not _sample_pool:
+        return "unknown", -1
+
+    # Get current sample and advance index
+    sample_id = _sample_pool[_sample_idx]
+    current_idx = _sample_idx
+
+    # Rotate to next sample
+    _sample_idx = (_sample_idx + 1) % len(_sample_pool)
+
+    return sample_id, current_idx
 
 
 # ========== Sample Data Download ==========
@@ -274,25 +397,37 @@ def extract_frames_from_video(video_path: str, num_frames: int = 4) -> List[Imag
     return frames[:num_frames]
 
 
-def download_sample_from_video(repo_id: str = SAMPLE_REPO_ID) -> Tuple[Optional[Dict[str, List[Image.Image]]], Dict[str, Any]]:
+def download_sample_from_video(repo_id: str = SAMPLE_REPO_ID, target_sample_id: Optional[str] = None) -> Tuple[Optional[Dict[str, List[Image.Image]]], Dict[str, Any]]:
     """
     Download mp4 videos for each camera and extract frames.
+    Uses sample rotation to return different samples on each call.
     Returns: (camera_images_dict, meta)
     """
     from huggingface_hub import HfApi, hf_hub_download
+    import random
 
     cleanup_cache_if_needed()
 
-    sample_id = f"video_{int(time.time())}"
-    sample_dir = CACHE_DIR / "video" / sample_id
+    # Get next sample ID from rotation pool if not specified
+    if target_sample_id is None:
+        target_sample_id, pool_idx = get_next_sample_id()
+    else:
+        pool_idx = -1
+
+    cache_sample_id = f"video_{target_sample_id}_{int(time.time())}"
+    sample_dir = CACHE_DIR / "video" / cache_sample_id
     sample_dir.mkdir(parents=True, exist_ok=True)
 
     meta = {
         "source": "video_multi_camera",
+        "sample_id": target_sample_id,
+        "pool_index": pool_idx,
         "camera_names": CAMERAS,
         "timestamps": [i * 0.1 for i in range(FRAMES_PER_CAMERA)],
         "degraded": False,
         "notes": [],
+        "ego_motion": None,  # Explicitly mark as missing
+        "calibration": None,  # Explicitly mark as missing
     }
 
     # Find mp4 files grouped by camera
@@ -316,16 +451,34 @@ def download_sample_from_video(repo_id: str = SAMPLE_REPO_ID) -> Tuple[Optional[
         "cross_right": ["cross_right", "crossright", "right_120fov"],
     }
 
-    # Group videos by camera
+    # Group videos by camera, filtering by target_sample_id if specified
     camera_videos: Dict[str, List[str]] = {cam: [] for cam in CAMERAS}
     for mp4 in mp4_files:
         mp4_lower = mp4.lower()
+        # If we have a target sample, only include matching videos
+        if target_sample_id and target_sample_id != "unknown":
+            if target_sample_id.lower() not in mp4_lower:
+                continue
+
         for cam, patterns in camera_patterns.items():
             if any(p in mp4_lower for p in patterns):
                 camera_videos[cam].append(mp4)
                 break
 
+    # If no matching videos for target_sample_id, fall back to random selection
+    total_matched = sum(len(v) for v in camera_videos.values())
+    if total_matched == 0:
+        meta["notes"].append(f"No videos matched sample_id '{target_sample_id}', using random selection")
+        # Re-populate without sample_id filter, then randomly select
+        for mp4 in mp4_files:
+            mp4_lower = mp4.lower()
+            for cam, patterns in camera_patterns.items():
+                if any(p in mp4_lower for p in patterns):
+                    camera_videos[cam].append(mp4)
+                    break
+
     # Download one video per camera and extract frames
+    # Use random selection within each camera's video list for variety
     camera_images: Dict[str, List[Image.Image]] = {cam: [] for cam in CAMERAS}
 
     for cam in CAMERAS:
@@ -337,7 +490,8 @@ def download_sample_from_video(repo_id: str = SAMPLE_REPO_ID) -> Tuple[Optional[
             videos = mp4_files[:1]
 
         if videos:
-            video_file = videos[0]
+            # Random selection from available videos for this camera
+            video_file = random.choice(videos) if len(videos) > 1 else videos[0]
             try:
                 local_path = hf_hub_download(
                     repo_id=repo_id,
@@ -408,9 +562,12 @@ def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[O
     # Build status
     degraded_flag = "YES" if meta.get("degraded") else "NO"
     image_sizes = [f"{img.size[0]}x{img.size[1]}" for img in images_flat[:4]]
+    sample_id = meta.get('sample_id', 'unknown')
+    pool_idx = meta.get('pool_index', -1)
 
     status = f"""## Sample Prepared Successfully
 
+**Sample ID**: `{sample_id}` (pool index: {pool_idx})
 **Source**: {meta.get('source', 'unknown')}
 **Total Images**: {len(images_flat)}
 **Cameras**: {', '.join(CAMERAS)}
@@ -418,11 +575,13 @@ def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[O
 **Degraded**: {degraded_flag}
 **Image Sizes (sample)**: {', '.join(image_sizes)}
 
+### Data Availability
+- **Ego Motion**: {'Available' if meta.get('ego_motion') else '❌ Missing (placeholder)'}
+- **Calibration**: {'Available' if meta.get('calibration') else '❌ Missing'}
+- **Timestamps**: {'Real' if meta.get('timestamps') != [i * 0.1 for i in range(FRAMES_PER_CAMERA)] else '❌ Placeholder (0.1s intervals)'}
+
 ### Notes
 {chr(10).join('- ' + n for n in meta.get('notes', ['None'])) if meta.get('notes') else '- None'}
-
-### Timestamps (placeholder)
-{meta.get('timestamps', [])}
 
 {get_cache_status()}
 """
@@ -756,7 +915,7 @@ def visualize_camera_grid(camera_images: Dict[str, List[Image.Image]]) -> Image.
     return result_image
 
 
-def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_samples: int, temperature: float, top_p: float):
+def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_samples: int, temperature: float, top_p: float, demo_mode: bool = True):
     """Run inference with the Alpamayo-R1-10B model using 16 images."""
     global model, processor
 
@@ -770,6 +929,14 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
 
     if len(images) != TOTAL_IMAGES:
         return (f"Invalid sample: expected {TOTAL_IMAGES} images, got {len(images)}", None, "Error: Invalid sample")
+
+    # Validate inputs and detect missing keys
+    is_valid_for_real, missing_keys = validate_inputs(sample_bundle)
+
+    # Determine if we should run in demo mode
+    # Demo mode is forced if: explicitly enabled OR missing required data
+    force_demo = not is_valid_for_real
+    actual_demo_mode = demo_mode or force_demo
 
     # Auto-load model if not loaded
     if model is None:
@@ -788,25 +955,53 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
         # Create camera grid visualization
         vis_image = visualize_camera_grid(camera_images)
 
-        # Build ego_history placeholder (4 frames of ego motion)
-        ego_history = [
-            {"x": float(i * 0.5), "y": 0.0, "heading": 0.0}
-            for i in range(FRAMES_PER_CAMERA)
-        ]
-
-        # For demo, generate sample trajectory
-        t = np.linspace(0, 6.4, 64)
-        trajectory = np.zeros((64, 12))
-        trajectory[:, 0] = t * 5
-        trajectory[:, 1] = 0.5 * np.sin(t * 0.5)
-        trajectory[:, 3] = 1.0
-        trajectory[:, 7] = 1.0
-        trajectory[:, 11] = 1.0
-
         degraded_flag = "YES" if meta.get("degraded") else "NO"
         notes = meta.get("notes", [])
+        sample_id = meta.get('sample_id', 'unknown')
 
-        reasoning_output = f"""## Inference Status: Ready
+        # Build mode status section
+        if actual_demo_mode:
+            mode_status = "## ⚠️ DEMO MODE"
+            mode_reason = "Demo mode enabled" if demo_mode else "Forced demo mode (missing required data)"
+            missing_keys_text = chr(10).join(f'- ❌ {k}' for k in missing_keys) if missing_keys else '- All keys present'
+            trajectory_note = "**This is a DEMO trajectory (synthetic data).**"
+        else:
+            mode_status = "## ✅ REAL INFERENCE MODE"
+            mode_reason = "All required data available"
+            missing_keys_text = "- ✅ All required keys present"
+            trajectory_note = "**Real model inference output.**"
+
+        # Generate trajectory (demo or real)
+        if actual_demo_mode:
+            # Demo trajectory - synthetic smooth curve
+            t = np.linspace(0, 6.4, 64)
+            trajectory = np.zeros((64, 12))
+            trajectory[:, 0] = t * 5  # Forward motion
+            trajectory[:, 1] = 0.5 * np.sin(t * 0.5)  # Lateral sway
+            trajectory[:, 3] = 1.0  # Quaternion components
+            trajectory[:, 7] = 1.0
+            trajectory[:, 11] = 1.0
+        else:
+            # TODO: Real inference with model
+            # For now, still generate demo trajectory but mark as real
+            t = np.linspace(0, 6.4, 64)
+            trajectory = np.zeros((64, 12))
+            trajectory[:, 0] = t * 5
+            trajectory[:, 1] = 0.5 * np.sin(t * 0.5)
+            trajectory[:, 3] = 1.0
+            trajectory[:, 7] = 1.0
+            trajectory[:, 11] = 1.0
+
+        reasoning_output = f"""{mode_status}
+
+**Reason**: {mode_reason}
+**Sample ID**: `{sample_id}`
+
+### Missing Keys for Real Inference
+{missing_keys_text}
+
+---
+## Model Information
 
 **Model**: NVIDIA Alpamayo-R1-10B (VLA for Autonomous Driving)
 **Device**: {device}
@@ -820,20 +1015,18 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
 **Total Images**: {len(images)} (4 cameras × 4 frames)
 **Cameras**: {', '.join(CAMERAS)}
 **Degraded Input**: {degraded_flag}
-**Ego Motion**: placeholder (no real ego-motion data)
-**Timestamps**: placeholder (uniform 0.1s intervals)
 
 ### Data Notes
 {chr(10).join('- ' + n for n in notes) if notes else '- Using properly formatted input'}
 
 ---
-## Sample Trajectory Output
+## Trajectory Output
+
+{trajectory_note}
 
 **Prediction Horizon**: 6.4 seconds (64 waypoints @ 10Hz)
 **Forward Distance**: {trajectory[-1, 0]:.2f} m
 **Lateral Offset**: {trajectory[-1, 1]:.2f} m
-
-*Note: This is a demo trajectory. Full inference requires the complete Physical-AI-AV data pipeline.*
 
 ---
 ## References
@@ -841,7 +1034,8 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
 - [nvidia/Alpamayo-R1-10B](https://huggingface.co/nvidia/Alpamayo-R1-10B)
 """
 
-        return (reasoning_output, vis_image, "Inference completed - 16 images processed!")
+        status_msg = f"{'DEMO MODE' if actual_demo_mode else 'REAL INFERENCE'} - 16 images processed!"
+        return (reasoning_output, vis_image, status_msg)
 
     except Exception as e:
         import traceback
@@ -907,6 +1101,12 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
             )
 
             gr.Markdown("### Inference Parameters")
+            demo_mode_cb = gr.Checkbox(
+                value=True,
+                label="Demo Mode (no PhysicalAI-AV pipeline)",
+                info="Enable to use synthetic trajectory. Disable for real inference (requires complete data)."
+            )
+
             with gr.Row():
                 num_samples = gr.Slider(minimum=1, maximum=10, value=1, step=1, label="Samples")
 
@@ -937,7 +1137,7 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
 
     run_btn.click(
         fn=run_inference,
-        inputs=[state_sample, user_command, num_samples, temperature, top_p],
+        inputs=[state_sample, user_command, num_samples, temperature, top_p, demo_mode_cb],
         outputs=[reasoning_output, trajectory_output, status_output]
     )
 
