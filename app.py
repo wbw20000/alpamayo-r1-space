@@ -159,7 +159,8 @@ def validate_inputs(sample_bundle: Optional[Dict]) -> Tuple[bool, List[str]]:
 def build_sample_pool(repo_id: str = SAMPLE_REPO_ID) -> List[str]:
     """
     Build a shuffled pool of video files for sample rotation.
-    Returns list of mp4 file paths from the dataset.
+    Returns list of unique sample UUIDs from the dataset.
+    File format: data/UUID.camera_type.mp4
     """
     from huggingface_hub import HfApi
     import random
@@ -174,41 +175,49 @@ def build_sample_pool(repo_id: str = SAMPLE_REPO_ID) -> List[str]:
     # Get all mp4 files
     mp4_files = [f for f in files if f.lower().endswith('.mp4')]
 
-    # Group by unique sample (using parent directory or first part of filename)
-    # Each "sample" is a set of 4 camera videos from the same scene
+    # Extract unique sample UUIDs from filenames
+    # Format: data/UUID.camera_type.mp4
     sample_groups: Dict[str, List[str]] = {}
     for mp4 in mp4_files:
-        # Extract sample identifier (e.g., "clips/sample_001/front_wide.mp4" -> "sample_001")
-        parts = Path(mp4).parts
-        if len(parts) >= 2:
-            sample_key = parts[-2]  # Use parent directory as sample key
+        filename = Path(mp4).name  # e.g., "01d3588e-bca7-4a18-8e74-c6cfe9e996db.camera_front_wide_120fov.mp4"
+        # Extract UUID (everything before the first ".camera")
+        if '.camera' in filename:
+            sample_key = filename.split('.camera')[0]
         else:
-            sample_key = Path(mp4).stem.split('_')[0]  # Use first part of filename
+            # Fallback: use first part before dot
+            sample_key = filename.split('.')[0]
 
         if sample_key not in sample_groups:
             sample_groups[sample_key] = []
         sample_groups[sample_key].append(mp4)
 
-    # Get unique sample keys that have videos for all cameras
+    # Get unique sample keys that have videos for required cameras
     valid_samples = []
     for key, videos in sample_groups.items():
-        # Check if this sample has at least one video per camera
+        # Check if this sample has at least one video for our required cameras
+        # Map camera patterns to check
+        camera_patterns = {
+            "front_wide": ["front_wide"],
+            "front_tele": ["front_tele", "tele_30fov"],
+            "cross_left": ["cross_left", "left_120fov"],
+            "cross_right": ["cross_right", "right_120fov"],
+        }
         has_all_cameras = True
-        for cam in CAMERAS:
-            if not any(cam in v.lower() for v in videos):
+        for cam, patterns in camera_patterns.items():
+            if not any(any(p in v.lower() for p in patterns) for v in videos):
                 has_all_cameras = False
                 break
         if has_all_cameras:
             valid_samples.append(key)
 
-    # If no valid multi-camera samples, just use all mp4 files
+    # If no valid multi-camera samples, use all sample keys
     if not valid_samples:
         valid_samples = list(sample_groups.keys())
 
     # Shuffle the samples
     random.shuffle(valid_samples)
 
-    print(f"[POOL] Built sample pool with {len(valid_samples)} unique samples")
+    print(f"[POOL] Built sample pool with {len(valid_samples)} unique samples (UUIDs)")
     return valid_samples
 
 
@@ -515,12 +524,12 @@ def download_sample_from_video(repo_id: str = SAMPLE_REPO_ID, target_sample_id: 
     return camera_images, meta
 
 
-def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[Optional[Dict], str]:
+def prepare_sample_bundle_with_id(source: str, target_sample_id: Optional[str], pool_idx: int) -> Tuple[Optional[Dict], str]:
     """
-    Main function to prepare sample bundle.
+    Main function to prepare sample bundle with a specific sample ID.
     Returns: (sample_bundle, status_markdown)
     """
-    print(f"[SAMPLE] Preparing sample with source: {source}")
+    print(f"[SAMPLE] Preparing sample with source: {source}, target_id: {target_sample_id}, pool_idx: {pool_idx}")
 
     camera_images = None
     meta = None
@@ -532,16 +541,20 @@ def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[O
         # Fallback to video if frames failed
         if camera_images is None:
             print("[SAMPLE] Frames not available, trying video fallback...")
-            camera_images, meta = download_sample_from_video()
+            camera_images, meta = download_sample_from_video(target_sample_id=target_sample_id)
+            if meta:
+                meta["pool_index"] = pool_idx
     else:
         # Video fallback directly
-        camera_images, meta = download_sample_from_video()
+        camera_images, meta = download_sample_from_video(target_sample_id=target_sample_id)
+        if meta:
+            meta["pool_index"] = pool_idx
 
     if camera_images is None:
         status = f"""## Sample Preparation Failed
 
 **Source**: {source}
-**Notes**: {'; '.join(meta.get('notes', ['Unknown error']))}
+**Notes**: {'; '.join(meta.get('notes', ['Unknown error']) if meta else ['Unknown error'])}
 
 {get_cache_status()}
 """
@@ -563,11 +576,11 @@ def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[O
     degraded_flag = "YES" if meta.get("degraded") else "NO"
     image_sizes = [f"{img.size[0]}x{img.size[1]}" for img in images_flat[:4]]
     sample_id = meta.get('sample_id', 'unknown')
-    pool_idx = meta.get('pool_index', -1)
+    current_pool_idx = meta.get('pool_index', pool_idx)
 
     status = f"""## Sample Prepared Successfully
 
-**Sample ID**: `{sample_id}` (pool index: {pool_idx})
+**Sample ID**: `{sample_id}` (pool index: {current_pool_idx})
 **Source**: {meta.get('source', 'unknown')}
 **Total Images**: {len(images_flat)}
 **Cameras**: {', '.join(CAMERAS)}
@@ -586,8 +599,16 @@ def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[O
 {get_cache_status()}
 """
 
-    print(f"[SAMPLE] Bundle prepared: {len(images_flat)} images, degraded={meta.get('degraded')}")
+    print(f"[SAMPLE] Bundle prepared: {len(images_flat)} images, degraded={meta.get('degraded')}, sample_id={sample_id}")
     return bundle, status
+
+
+def prepare_sample_bundle(source: str = "Dataset frames (preferred)") -> Tuple[Optional[Dict], str]:
+    """
+    Main function to prepare sample bundle (legacy, uses global rotation).
+    Returns: (sample_bundle, status_markdown)
+    """
+    return prepare_sample_bundle_with_id(source, None, -1)
 
 
 # ========== Runtime Installation of alpamayo_r1 ==========
@@ -1068,8 +1089,10 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
     3. Click "Run Inference" to process the sample
     """)
 
-    # State for sample bundle
+    # State for sample bundle and sample rotation
     state_sample = gr.State(value=None)
+    state_sample_pool = gr.State(value=[])
+    state_sample_idx = gr.State(value=0)
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1125,14 +1148,34 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
     # Event handlers
     load_btn.click(fn=load_model, outputs=[model_status])
 
-    def on_prepare_sample(source):
-        bundle, status = prepare_sample_bundle(source)
-        return bundle, status
+    def on_prepare_sample(source, sample_pool, sample_idx):
+        """Prepare sample with rotation through sample pool."""
+        import random
+
+        # Build pool if empty
+        if not sample_pool:
+            sample_pool = build_sample_pool()
+            random.shuffle(sample_pool)
+            sample_idx = 0
+
+        # Get current sample ID
+        if sample_pool:
+            current_sample_id = sample_pool[sample_idx]
+            # Rotate to next index for next call
+            next_idx = (sample_idx + 1) % len(sample_pool)
+        else:
+            current_sample_id = None
+            next_idx = 0
+
+        # Prepare bundle with specific sample ID
+        bundle, status = prepare_sample_bundle_with_id(source, current_sample_id, sample_idx)
+
+        return bundle, status, sample_pool, next_idx
 
     prepare_btn.click(
         fn=on_prepare_sample,
-        inputs=[sample_source],
-        outputs=[state_sample, sample_status]
+        inputs=[sample_source, state_sample_pool, state_sample_idx],
+        outputs=[state_sample, sample_status, state_sample_pool, state_sample_idx]
     )
 
     run_btn.click(
