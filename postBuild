@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euxo pipefail
+
+echo "=== postBuild: Installing NVlabs/alpamayo package ==="
+
+# Upgrade pip first
+pip install -U pip
+
+# Try normal install first; if flash-attn compilation fails, fallback to --no-deps
+echo "Attempting full install of alpamayo..."
+if ! pip install "git+https://github.com/NVlabs/alpamayo.git@main" ; then
+    echo "Full install failed (likely flash-attn), trying --no-deps..."
+    pip install --no-deps "git+https://github.com/NVlabs/alpamayo.git@main"
+fi
+
+# Verify alpamayo_r1 can be imported and print versions
+echo "=== Verifying alpamayo_r1 installation ==="
+python -c "
+import sys
+import torch
+import transformers
+
+print('Python:', sys.version)
+print('PyTorch:', torch.__version__)
+print('Transformers:', transformers.__version__)
+print('CUDA available:', torch.cuda.is_available())
+
+try:
+    import alpamayo_r1
+    print('alpamayo_r1 location:', alpamayo_r1.__file__)
+    print('alpamayo_r1 imported successfully!')
+except ImportError as e:
+    print('ERROR: alpamayo_r1 import failed:', e)
+    exit(1)
+"
+
+echo "=== postBuild complete ==="

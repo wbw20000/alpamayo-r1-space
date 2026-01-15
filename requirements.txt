@@ -1,0 +1,31 @@
+# Core PyTorch stack (aligned with NVlabs/alpamayo requirements)
+# Model card: PyTorch 2.8+, Transformers 4.57.1+
+torch==2.8.0
+torchvision==0.23.0
+
+# Transformers ecosystem - use exact version required by Alpamayo
+transformers==4.57.1
+accelerate>=0.27.0
+tokenizers>=0.21.0
+safetensors>=0.4.0
+
+# HuggingFace utilities
+huggingface-hub>=0.21.0
+hf_transfer>=0.1.4
+
+# Core dependencies
+einops>=0.8.1
+pillow>=10.0.0
+matplotlib>=3.8.0
+numpy>=1.24.0
+
+# Dependencies required by alpamayo_r1 (installed via --no-deps)
+hydra-core>=1.3.2
+hydra-colorlog>=1.2.0
+omegaconf>=2.3.0
+av>=14.0.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# Note: flash-attn is NOT included here - will use SDPA fallback
+# Note: physical_ai_av and alpamayo_r1 are installed via postBuild/runtime
