@@ -48,6 +48,10 @@ debug_report.md
 test_image.png
 *.log
 
+# Cache directories
+cache/
+.cache/
+
 # Secrets
 .env
 *.secret
