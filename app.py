@@ -314,7 +314,7 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
                     if video_name not in zf.namelist():
                         result['errors'].append(f"Video {video_name} not found in zip")
                         # Use placeholder images
-                        for _ in range(NUM_FRAMES):
+                        for _ in range(FRAMES_PER_CAMERA):
                             placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
                             camera_images[cam_key].append(placeholder)
                             all_images.append(placeholder)
@@ -338,7 +338,7 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
                             frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
 
                             frames_extracted = []
-                            for i in range(NUM_FRAMES):
+                            for i in range(FRAMES_PER_CAMERA):
                                 frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
                                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                                 ret, frame = cap.read()
@@ -360,7 +360,7 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
                         except ImportError:
                             result['errors'].append("cv2 not available for video extraction")
                             # Use placeholders
-                            for _ in range(NUM_FRAMES):
+                            for _ in range(FRAMES_PER_CAMERA):
                                 placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
                                 camera_images[cam_key].append(placeholder)
                                 all_images.append(placeholder)
@@ -368,7 +368,7 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
             except Exception as cam_err:
                 result['errors'].append(f"{cam_key}: {str(cam_err)[:50]}")
                 # Use placeholders for this camera
-                for _ in range(NUM_FRAMES):
+                for _ in range(FRAMES_PER_CAMERA):
                     placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
                     camera_images[cam_key].append(placeholder)
                     all_images.append(placeholder)
