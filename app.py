@@ -229,6 +229,164 @@ def fetch_official_sidecars(clip_id: str) -> Dict[str, Any]:
     return result
 
 
+def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any]:
+    """
+    Download images from Official dataset for a specific clip_id.
+
+    Args:
+        clip_id: UUID of the clip
+        t0_us: Starting timestamp in microseconds
+
+    Returns: {
+        'images': List of 16 PIL images (4 cameras x 4 frames),
+        'camera_images': Dict mapping camera name to list of images,
+        'chunk': int chunk number,
+        'available': bool,
+        'errors': List[str]
+    }
+    """
+    from huggingface_hub import hf_hub_download
+    import pandas as pd
+    import zipfile
+    import tempfile
+    import os
+
+    result = {
+        'images': [],
+        'camera_images': {},
+        'chunk': None,
+        'available': False,
+        'errors': []
+    }
+
+    token = get_hf_token()
+    if not token:
+        result['errors'].append("HF_TOKEN required")
+        return result
+
+    try:
+        # Step 1: Get chunk number from clip_index.parquet
+        print(f"[OFFICIAL] Fetching clip_index.parquet to find chunk for {clip_id}...")
+        index_path = hf_hub_download(
+            repo_id=OFFICIAL_REPO_ID,
+            filename="clip_index.parquet",
+            repo_type="dataset",
+            token=token
+        )
+
+        index_df = pd.read_parquet(index_path)
+        if clip_id not in index_df.index:
+            result['errors'].append(f"clip_id {clip_id} not found in dataset")
+            return result
+
+        chunk = int(index_df.loc[clip_id, 'chunk'])
+        result['chunk'] = chunk
+        print(f"[OFFICIAL] Found clip in chunk {chunk}")
+
+        # Step 2: Download camera zip files and extract videos
+        # Camera mapping for Alpamayo (4 cameras)
+        camera_names = {
+            'front_wide': 'camera_front_wide_120fov',
+            'cross_left': 'camera_cross_left_120fov',
+            'cross_right': 'camera_cross_right_120fov',
+            'rear_tele': 'camera_rear_tele_30fov'
+        }
+
+        all_images = []
+        camera_images = {cam: [] for cam in camera_names.keys()}
+
+        for cam_key, cam_name in camera_names.items():
+            try:
+                # Download chunk zip file
+                zip_filename = f"camera/{cam_name}/{cam_name}.chunk_{chunk:04d}.zip"
+                print(f"[OFFICIAL] Downloading {zip_filename}...")
+
+                zip_path = hf_hub_download(
+                    repo_id=OFFICIAL_REPO_ID,
+                    filename=zip_filename,
+                    repo_type="dataset",
+                    token=token
+                )
+
+                # Extract video from zip
+                video_name = f"{clip_id}.{cam_name}.mp4"
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    if video_name not in zf.namelist():
+                        result['errors'].append(f"Video {video_name} not found in zip")
+                        # Use placeholder images
+                        for _ in range(NUM_FRAMES):
+                            placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
+                            camera_images[cam_key].append(placeholder)
+                            all_images.append(placeholder)
+                        continue
+
+                    # Extract video to temp file
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        zf.extract(video_name, tmpdir)
+                        video_path = os.path.join(tmpdir, video_name)
+
+                        # Extract frames from video using cv2
+                        try:
+                            import cv2
+                            cap = cv2.VideoCapture(video_path)
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                            # Calculate frame indices for 4 frames at 2Hz (0.5s apart)
+                            # Starting from t0_us
+                            start_frame = int((t0_us / 1e6) * fps) if fps > 0 else 0
+                            frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
+
+                            frames_extracted = []
+                            for i in range(NUM_FRAMES):
+                                frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                                ret, frame = cap.read()
+                                if ret:
+                                    # Convert BGR to RGB
+                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    img = Image.fromarray(frame_rgb)
+                                    frames_extracted.append(img)
+                                else:
+                                    # Use placeholder if frame read fails
+                                    frames_extracted.append(Image.new('RGB', (1920, 1080), color=(100, 100, 100)))
+
+                            cap.release()
+
+                            camera_images[cam_key] = frames_extracted
+                            all_images.extend(frames_extracted)
+                            print(f"[OFFICIAL] Extracted {len(frames_extracted)} frames from {cam_key}")
+
+                        except ImportError:
+                            result['errors'].append("cv2 not available for video extraction")
+                            # Use placeholders
+                            for _ in range(NUM_FRAMES):
+                                placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
+                                camera_images[cam_key].append(placeholder)
+                                all_images.append(placeholder)
+
+            except Exception as cam_err:
+                result['errors'].append(f"{cam_key}: {str(cam_err)[:50]}")
+                # Use placeholders for this camera
+                for _ in range(NUM_FRAMES):
+                    placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
+                    camera_images[cam_key].append(placeholder)
+                    all_images.append(placeholder)
+
+        result['images'] = all_images
+        result['camera_images'] = camera_images
+        result['available'] = len(all_images) == TOTAL_IMAGES
+
+        print(f"[OFFICIAL] Total images: {len(all_images)}, Available: {result['available']}")
+
+    except Exception as e:
+        import traceback
+        result['errors'].append(f"fetch_official_images error: {e}")
+        print(f"[OFFICIAL] Error: {traceback.format_exc()}")
+
+    return result
+
+
 def compute_minade6(pred_xyz: torch.Tensor, gt_xyz: torch.Tensor) -> float:
     """
     Compute minADE6@6.4s metric.
@@ -1230,26 +1388,43 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
     minade_value = None
     metric_status_text = ""
 
-    # For Official mode, try to fetch sidecar data
+    # For Official mode, fetch sidecar data AND images from Official dataset
     if is_official_mode:
-        print(f"[OFFICIAL] Fetching sidecars for clip_id: {clip_id}")
+        print(f"[OFFICIAL] Fetching data for clip_id: {clip_id}")
+
+        # Fetch sidecars (calibration, etc.)
         sidecars = fetch_official_sidecars(clip_id.strip())
         if sidecars['errors']:
             print(f"[OFFICIAL] Sidecar errors: {sidecars['errors']}")
 
-        # Official mode can work with sample data if available, otherwise use placeholder
-        if sample_bundle:
-            images = sample_bundle.get("images", [])
-            camera_images = sample_bundle.get("camera_images", {})
-            meta = sample_bundle.get("meta", {})
-        else:
-            # Create placeholder for Official mode without sample data
+        # Fetch images from Official dataset (this is the key change!)
+        print(f"[OFFICIAL] Fetching images from Official dataset...")
+        official_images = fetch_official_images(clip_id.strip(), t0_us)
+
+        if official_images['available']:
+            # Use images from Official dataset
+            images = official_images['images']
+            camera_images = official_images['camera_images']
             meta = {
-                'source': 'official_mode',
+                'source': 'official_dataset',
                 'sample_id': clip_id,
-                'notes': ['Official mode - using clip_id for evaluation'],
+                'chunk': official_images['chunk'],
+                'notes': [f'Official dataset - chunk {official_images["chunk"]}'],
                 'degraded': False
             }
+            if official_images['errors']:
+                meta['notes'].extend(official_images['errors'])
+            print(f"[OFFICIAL] Successfully loaded {len(images)} images from Official dataset")
+        else:
+            # Official dataset images not available - report errors
+            error_msgs = official_images.get('errors', ['Unknown error'])
+            meta = {
+                'source': 'official_mode_failed',
+                'sample_id': clip_id,
+                'notes': ['Failed to load Official dataset images'] + error_msgs,
+                'degraded': True
+            }
+            print(f"[OFFICIAL] Failed to load images: {error_msgs}")
     else:
         # Demo mode - use sample bundle
         images = sample_bundle.get("images", [])

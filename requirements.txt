@@ -27,6 +27,9 @@ av>=14.0.0
 pandas>=2.0.0
 scipy>=1.10.0
 
-# Note: av (PyAV) is used for video frame extraction
+# Video frame extraction
+opencv-python-headless>=4.8.0
+
+# Note: av (PyAV) is also available for video processing
 # Note: flash-attn is NOT included here - will use SDPA fallback
 # Note: physical_ai_av and alpamayo_r1 are installed via postBuild/runtime
