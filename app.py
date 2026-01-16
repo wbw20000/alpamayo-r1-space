@@ -1288,70 +1288,178 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
         # Generate trajectory
         t = np.linspace(0, 6.4, 64)
         trajectory = np.zeros((64, 3))  # (64, 3) for x, y, z
+        reasoning_text = ""  # Chain-of-Causation reasoning from model
 
-        if is_official_mode and not actual_demo_mode:
-            # Official mode: generate 6 trajectory samples for minADE calculation
-            # For now, generate synthetic but varied trajectories to demonstrate minADE
-            pred_trajectories = []
-            for i in range(6):
-                traj = np.zeros((64, 3))
-                traj[:, 0] = t * (4.5 + 0.5 * np.random.randn())  # Forward with variance
-                traj[:, 1] = 0.3 * np.sin(t * 0.5 + 0.3 * i)  # Lateral variance
-                traj[:, 2] = 0.0  # Height
-                pred_trajectories.append(traj)
+        # ========== REAL MODEL INFERENCE ==========
+        # Check if we have images for real inference
+        has_images = images is not None and len(images) == TOTAL_IMAGES
+        use_real_inference = has_images and not actual_demo_mode
 
-            pred_trajectories = np.stack(pred_trajectories)  # (6, 64, 3)
+        if use_real_inference:
+            print(f"[INFERENCE] Running REAL model inference with {len(images)} images...")
+            try:
+                from alpamayo_r1 import helper
 
-            # Ground truth trajectory (synthetic for demo)
-            gt_trajectory = np.zeros((64, 3))
-            gt_trajectory[:, 0] = t * 5.0
-            gt_trajectory[:, 1] = 0.3 * np.sin(t * 0.5)
+                # Prepare images tensor: need (16,) list of PIL images -> tensor
+                # Images should be in order: 4 cameras x 4 frames
+                image_list = images  # Already a list of PIL images
 
-            # Compute minADE6
-            gt_xy = gt_trajectory[:, :2].T  # (2, 64)
-            pred_xy = pred_trajectories[:, :, :2].transpose(0, 2, 1)  # (6, 2, 64)
-            diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)  # (6,)
-            minade_value = float(diff.min())
-            best_idx = int(diff.argmin())
-            trajectory = pred_trajectories[best_idx]
+                # Create message with images
+                messages = helper.create_message(image_list)
 
-            metric_status_text = f"PAPER-COMPARABLE (minADE6={minade_value:.4f}m)"
-            mode_status = "## Official (Paper-Comparable) Mode"
-            mode_reason = f"Using clip_id: {clip_id}"
-            trajectory_note = f"**minADE6@6.4s: {minade_value:.4f} m** (best of 6 samples)"
+                # Apply chat template
+                inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    continue_final_message=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
 
-            # Add calibration status
-            if sidecars and sidecars.get('calibration'):
-                notes.append("Calibration data: Available")
+                # Prepare model inputs
+                model_inputs = {
+                    "tokenized_data": {k: v.to(device) for k, v in inputs.items()},
+                    "ego_history_xyz": torch.zeros(1, 4, 3, device=device, dtype=torch.float32),
+                    "ego_history_rot": torch.zeros(1, 4, 4, device=device, dtype=torch.float32),
+                }
+
+                # Number of trajectory samples
+                n_samples = num_samples if is_official_mode else 1
+                print(f"[INFERENCE] Generating {n_samples} trajectory samples...")
+
+                # Run model inference
+                with torch.no_grad():
+                    pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=model_inputs,
+                        top_p=top_p,
+                        temperature=temperature,
+                        num_traj_samples=n_samples,
+                        max_generation_length=256,
+                        return_extra=True,
+                    )
+
+                # Extract trajectory: pred_xyz is (B, 1, num_samples, 64, 3)
+                pred_np = pred_xyz.cpu().numpy()  # (1, 1, n_samples, 64, 3)
+                print(f"[INFERENCE] Model output shape: {pred_np.shape}")
+
+                # Get reasoning text from extra
+                if extra and "reasoning" in extra:
+                    reasoning_text = extra["reasoning"]
+                elif extra and "chain_of_causation" in extra:
+                    reasoning_text = extra["chain_of_causation"]
+
+                if is_official_mode:
+                    # Official mode: use all samples for minADE calculation
+                    pred_trajectories = pred_np[0, 0]  # (n_samples, 64, 3)
+
+                    # For now, use synthetic GT since egomotion is COMING SOON
+                    gt_trajectory = np.zeros((64, 3))
+                    gt_trajectory[:, 0] = t * 5.0
+                    gt_trajectory[:, 1] = 0.3 * np.sin(t * 0.5)
+
+                    # Compute minADE6
+                    gt_xy = gt_trajectory[:, :2].T  # (2, 64)
+                    pred_xy = pred_trajectories[:, :, :2].transpose(0, 2, 1)  # (n_samples, 2, 64)
+                    diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)  # (n_samples,)
+                    minade_value = float(diff.min())
+                    best_idx = int(diff.argmin())
+                    trajectory = pred_trajectories[best_idx]
+
+                    metric_status_text = f"REAL INFERENCE (minADE6={minade_value:.4f}m, synthetic GT)"
+                    mode_status = "## Official Mode - REAL Inference"
+                    mode_reason = f"Using clip_id: {clip_id} with {n_samples} trajectory samples"
+                    trajectory_note = f"**REAL MODEL OUTPUT** - minADE6@6.4s: {minade_value:.4f} m (best of {n_samples} samples, synthetic GT)"
+                    notes.append("Model inference: REAL (not synthetic)")
+                    notes.append(f"Trajectory samples: {n_samples}")
+                    notes.append("Ground truth: Synthetic (egomotion COMING SOON)")
+                else:
+                    # Non-official mode: use first sample
+                    trajectory = pred_np[0, 0, 0]  # (64, 3)
+
+                    mode_status = "## Real Inference Mode"
+                    mode_reason = "All required data available"
+                    trajectory_note = "**REAL MODEL OUTPUT** - Actual prediction from Alpamayo-R1"
+                    metric_status_text = "REAL INFERENCE"
+                    notes.append("Model inference: REAL (not synthetic)")
+
+                # Add calibration status
+                if sidecars and sidecars.get('calibration'):
+                    notes.append("Calibration data: Available")
+                else:
+                    notes.append("Calibration data: Not available (using fallback projection)")
+
+                print(f"[INFERENCE] Real inference complete! Trajectory shape: {trajectory.shape}")
+
+            except Exception as infer_err:
+                import traceback
+                print(f"[INFERENCE] Real inference failed: {infer_err}")
+                print(traceback.format_exc())
+                # Fall back to synthetic
+                use_real_inference = False
+                notes.append(f"Real inference failed: {str(infer_err)[:100]}")
+                notes.append("Falling back to synthetic trajectory")
+
+        # ========== SYNTHETIC FALLBACK ==========
+        if not use_real_inference:
+            if is_official_mode and not actual_demo_mode:
+                # Official mode fallback: generate synthetic but varied trajectories
+                print("[INFERENCE] Using SYNTHETIC trajectories (fallback)")
+                pred_trajectories = []
+                for i in range(num_samples):
+                    traj = np.zeros((64, 3))
+                    traj[:, 0] = t * (4.5 + 0.5 * np.random.randn())  # Forward with variance
+                    traj[:, 1] = 0.3 * np.sin(t * 0.5 + 0.3 * i)  # Lateral variance
+                    traj[:, 2] = 0.0  # Height
+                    pred_trajectories.append(traj)
+
+                pred_trajectories = np.stack(pred_trajectories)  # (n_samples, 64, 3)
+
+                # Ground truth trajectory (synthetic)
+                gt_trajectory = np.zeros((64, 3))
+                gt_trajectory[:, 0] = t * 5.0
+                gt_trajectory[:, 1] = 0.3 * np.sin(t * 0.5)
+
+                # Compute minADE
+                gt_xy = gt_trajectory[:, :2].T  # (2, 64)
+                pred_xy = pred_trajectories[:, :, :2].transpose(0, 2, 1)
+                diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
+                minade_value = float(diff.min())
+                best_idx = int(diff.argmin())
+                trajectory = pred_trajectories[best_idx]
+
+                metric_status_text = f"SYNTHETIC (minADE6={minade_value:.4f}m)"
+                mode_status = "## Official Mode - SYNTHETIC Fallback"
+                mode_reason = f"Using clip_id: {clip_id} (no images for real inference)"
+                trajectory_note = f"**SYNTHETIC trajectory** - minADE6@6.4s: {minade_value:.4f} m"
+                notes.append("WARNING: Using synthetic trajectory (prepare sample data for real inference)")
+
+                if sidecars and sidecars.get('calibration'):
+                    notes.append("Calibration data: Available")
+                else:
+                    notes.append("Calibration data: Not available")
+
+            elif actual_demo_mode:
+                # Demo trajectory - synthetic smooth curve
+                trajectory[:, 0] = t * 5  # Forward motion
+                trajectory[:, 1] = 0.5 * np.sin(t * 0.5)  # Lateral sway
+                trajectory[:, 2] = 0.0  # Height
+
+                mode_status = "## Demo Mode"
+                mode_reason = "Demo mode enabled" if demo_mode else "Forced demo mode (missing required data)"
+                missing_keys_text = chr(10).join(f'- {k}' for k in missing_keys) if missing_keys else '- All keys present'
+                trajectory_note = "**This is a DEMO trajectory (synthetic data).**"
+                metric_status_text = "DEMO - no metric"
             else:
-                notes.append("Calibration data: Not available (using fallback projection)")
+                # Non-official, non-demo fallback
+                trajectory[:, 0] = t * 5
+                trajectory[:, 1] = 0.5 * np.sin(t * 0.5)
+                trajectory[:, 2] = 0.0
 
-            if sidecars and sidecars.get('egomotion'):
-                notes.append("Ego motion data: Available")
-            else:
-                notes.append("Ego motion data: COMING SOON (using synthetic)")
-
-        elif actual_demo_mode:
-            # Demo trajectory - synthetic smooth curve
-            trajectory[:, 0] = t * 5  # Forward motion
-            trajectory[:, 1] = 0.5 * np.sin(t * 0.5)  # Lateral sway
-            trajectory[:, 2] = 0.0  # Height
-
-            mode_status = "## Demo Mode"
-            mode_reason = "Demo mode enabled" if demo_mode else "Forced demo mode (missing required data)"
-            missing_keys_text = chr(10).join(f'- {k}' for k in missing_keys) if missing_keys else '- All keys present'
-            trajectory_note = "**This is a DEMO trajectory (synthetic data).**"
-            metric_status_text = "DEMO - no metric"
-        else:
-            # Real inference mode (non-official)
-            trajectory[:, 0] = t * 5
-            trajectory[:, 1] = 0.5 * np.sin(t * 0.5)
-            trajectory[:, 2] = 0.0
-
-            mode_status = "## Real Inference Mode"
-            mode_reason = "All required data available"
-            trajectory_note = "**Real model inference output.**"
-            metric_status_text = "REAL - no GT for metric"
+                mode_status = "## Fallback Mode"
+                mode_reason = "No images available for real inference"
+                trajectory_note = "**Synthetic trajectory (no images loaded).**"
+                metric_status_text = "FALLBACK - no inference"
 
         # Get front camera image for visualization
         front_camera_image = None
