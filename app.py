@@ -260,6 +260,9 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
     """
     Download images from Official dataset for a specific clip_id.
 
+    Uses DIRECT URL access to individual mp4 files instead of downloading
+    entire zip archives (which are 1-2 GB each and cause timeouts).
+
     Args:
         clip_id: UUID of the clip
         t0_us: Starting timestamp in microseconds
@@ -274,9 +277,8 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
     """
     from huggingface_hub import hf_hub_download
     import pandas as pd
-    import zipfile
     import tempfile
-    import os
+    import urllib.request
 
     result = {
         'images': [],
@@ -310,8 +312,9 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
         result['chunk'] = chunk
         print(f"[OFFICIAL] Found clip in chunk {chunk}")
 
-        # Step 2: Download camera zip files and extract videos
-        # Camera mapping for Alpamayo (4 cameras)
+        # Step 2: Download individual mp4 files using DIRECT URL
+        # This avoids downloading entire zip archives (1-2 GB each)
+        # URL format: camera/{chunk}/{clip_id}.{cam_name}.mp4
         camera_names = {
             'front_wide': 'camera_front_wide_120fov',
             'cross_left': 'camera_cross_left_120fov',
@@ -322,75 +325,91 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
         all_images = []
         camera_images = {cam: [] for cam in camera_names.keys()}
 
+        # Base URL for direct file access
+        base_url = f"https://huggingface.co/datasets/{OFFICIAL_REPO_ID}/resolve/main"
+
         for cam_key, cam_name in camera_names.items():
             try:
-                # Download chunk zip file
-                zip_filename = f"camera/{cam_name}/{cam_name}.chunk_{chunk:04d}.zip"
-                print(f"[OFFICIAL] Downloading {zip_filename}...")
+                # Direct URL to individual mp4 file
+                video_filename = f"{clip_id}.{cam_name}.mp4"
+                video_url = f"{base_url}/camera/{chunk}/{video_filename}"
+                print(f"[OFFICIAL] Downloading {cam_key}: {video_url[:80]}...")
 
-                zip_path = hf_hub_download(
-                    repo_id=OFFICIAL_REPO_ID,
-                    filename=zip_filename,
-                    repo_type="dataset",
-                    token=token
-                )
+                # Download video to temp file with authentication
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
+                    tmp_path = tmp_file.name
 
-                # Extract video from zip
-                video_name = f"{clip_id}.{cam_name}.mp4"
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    if video_name not in zf.namelist():
-                        result['errors'].append(f"Video {video_name} not found in zip")
+                    # Create request with auth header
+                    request = urllib.request.Request(video_url)
+                    request.add_header('Authorization', f'Bearer {token}')
+
+                    try:
+                        with urllib.request.urlopen(request, timeout=60) as response:
+                            tmp_file.write(response.read())
+                        print(f"[OFFICIAL] Downloaded {cam_key} successfully")
+                    except urllib.error.HTTPError as http_err:
+                        if http_err.code == 404:
+                            result['errors'].append(f"{cam_key}: video not found (404)")
+                        else:
+                            result['errors'].append(f"{cam_key}: HTTP {http_err.code}")
                         # Use placeholder images
                         for _ in range(FRAMES_PER_CAMERA):
                             placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
                             camera_images[cam_key].append(placeholder)
                             all_images.append(placeholder)
                         continue
+                    except Exception as dl_err:
+                        result['errors'].append(f"{cam_key}: download failed - {str(dl_err)[:30]}")
+                        for _ in range(FRAMES_PER_CAMERA):
+                            placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
+                            camera_images[cam_key].append(placeholder)
+                            all_images.append(placeholder)
+                        continue
 
-                    # Extract video to temp file
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        zf.extract(video_name, tmpdir)
-                        video_path = os.path.join(tmpdir, video_name)
+                # Extract frames from video using cv2
+                try:
+                    import cv2
+                    cap = cv2.VideoCapture(tmp_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                        # Extract frames from video using cv2
-                        try:
-                            import cv2
-                            cap = cv2.VideoCapture(video_path)
-                            fps = cap.get(cv2.CAP_PROP_FPS)
-                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    # Calculate frame indices for 4 frames at 2Hz (0.5s apart)
+                    start_frame = int((t0_us / 1e6) * fps) if fps > 0 else 0
+                    frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
 
-                            # Calculate frame indices for 4 frames at 2Hz (0.5s apart)
-                            # Starting from t0_us
-                            start_frame = int((t0_us / 1e6) * fps) if fps > 0 else 0
-                            frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
+                    frames_extracted = []
+                    for i in range(FRAMES_PER_CAMERA):
+                        frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret, frame = cap.read()
+                        if ret:
+                            # Convert BGR to RGB
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            img = Image.fromarray(frame_rgb)
+                            frames_extracted.append(img)
+                        else:
+                            # Use placeholder if frame read fails
+                            frames_extracted.append(Image.new('RGB', (1920, 1080), color=(100, 100, 100)))
 
-                            frames_extracted = []
-                            for i in range(FRAMES_PER_CAMERA):
-                                frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
-                                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                                ret, frame = cap.read()
-                                if ret:
-                                    # Convert BGR to RGB
-                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                    img = Image.fromarray(frame_rgb)
-                                    frames_extracted.append(img)
-                                else:
-                                    # Use placeholder if frame read fails
-                                    frames_extracted.append(Image.new('RGB', (1920, 1080), color=(100, 100, 100)))
+                    cap.release()
 
-                            cap.release()
+                    camera_images[cam_key] = frames_extracted
+                    all_images.extend(frames_extracted)
+                    print(f"[OFFICIAL] Extracted {len(frames_extracted)} frames from {cam_key}")
 
-                            camera_images[cam_key] = frames_extracted
-                            all_images.extend(frames_extracted)
-                            print(f"[OFFICIAL] Extracted {len(frames_extracted)} frames from {cam_key}")
-
-                        except ImportError:
-                            result['errors'].append("cv2 not available for video extraction")
-                            # Use placeholders
-                            for _ in range(FRAMES_PER_CAMERA):
-                                placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
-                                camera_images[cam_key].append(placeholder)
-                                all_images.append(placeholder)
+                except ImportError:
+                    result['errors'].append("cv2 not available for video extraction")
+                    for _ in range(FRAMES_PER_CAMERA):
+                        placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
+                        camera_images[cam_key].append(placeholder)
+                        all_images.append(placeholder)
+                finally:
+                    # Clean up temp file
+                    try:
+                        import os
+                        os.unlink(tmp_path)
+                    except:
+                        pass
 
             except Exception as cam_err:
                 result['errors'].append(f"{cam_key}: {str(cam_err)[:50]}")

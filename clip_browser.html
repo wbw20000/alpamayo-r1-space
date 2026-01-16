@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhysicalAI-AV Clip Browser</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 { color: #333; }
+        .stats {
+            background: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .filters {
+            background: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        .filters select, .filters input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .clip-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 20px;
+        }
+        .clip-card {
+            background: #fff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .clip-card video {
+            width: 100%;
+            height: 225px;
+            object-fit: cover;
+            background: #000;
+        }
+        .clip-info {
+            padding: 15px;
+        }
+        .clip-id {
+            font-family: monospace;
+            font-size: 12px;
+            color: #666;
+            word-break: break-all;
+            background: #f0f0f0;
+            padding: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .clip-id:hover {
+            background: #e0e0e0;
+        }
+        .clip-meta {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+        }
+        .badge {
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .badge-test { background: #e3f2fd; color: #1565c0; }
+        .badge-train { background: #e8f5e9; color: #2e7d32; }
+        .badge-val { background: #fff3e0; color: #ef6c00; }
+        .copy-btn {
+            background: #1976d2;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .copy-btn:hover { background: #1565c0; }
+        .copied { background: #4caf50 !important; }
+    </style>
+</head>
+<body>
+    <h1>PhysicalAI-AV Clip Browser</h1>
+
+    <div class="stats">
+        <strong>Dataset Statistics:</strong>
+        Total: 227,985 clips | Train: 126,839 | Val: 65,971 | Test: 35,175
+    </div>
+
+    <div class="filters">
+        <label>Split:
+            <select id="splitFilter" onchange="filterClips()">
+                <option value="all">All</option>
+                <option value="test" selected>Test</option>
+                <option value="train">Train</option>
+                <option value="val">Validation</option>
+            </select>
+        </label>
+        <label>Chunk:
+            <input type="number" id="chunkFilter" placeholder="e.g., 298" onchange="filterClips()">
+        </label>
+        <button onclick="loadMoreClips()">Load More</button>
+    </div>
+
+    <div class="clip-grid" id="clipGrid"></div>
+
+    <script>
+        // Sample clips data (can be expanded)
+        const clips = [
+            // Test clips (chunk 298)
+            { clip_id: "48ec6a11-5802-4c02-9912-c0fe78937110", split: "test", chunk: 298 },
+            { clip_id: "1f9a486f-76fb-497d-a08a-f490b7838c3a", split: "test", chunk: 298 },
+            { clip_id: "5198eb48-612b-4632-9bcf-db26b9975e07", split: "test", chunk: 298 },
+            { clip_id: "7b6c8132-824f-488a-9971-ab2863569739", split: "test", chunk: 298 },
+            { clip_id: "7124d713-761f-4162-95b4-109c33890168", split: "test", chunk: 298 },
+            // Test clips (chunk 299)
+            { clip_id: "adc59594-2ec2-4bb0-bc44-46dfc605070b", split: "test", chunk: 299 },
+            { clip_id: "5cbfc177-b723-40fe-ab41-68db53ce8e66", split: "test", chunk: 300 },
+            { clip_id: "28af1545-ae1a-4924-a6b2-ee11d02ee559", split: "test", chunk: 301 },
+            { clip_id: "01cc51be-7eaa-410c-8bc7-2b1870478433", split: "test", chunk: 302 },
+            { clip_id: "73a4c923-8556-43fa-b4ff-6dbdc0b6a30c", split: "test", chunk: 303 },
+            // Train clips (chunk 0)
+            { clip_id: "25cd4769-5dcf-4b53-a351-bf2c5deb6124", split: "train", chunk: 0 },
+            { clip_id: "2edf278f-d5e3-4b83-b5df-923a04335725", split: "train", chunk: 0 },
+            { clip_id: "eed514a0-a366-4550-b9bd-4c296c531511", split: "train", chunk: 0 },
+            { clip_id: "ecafce84-447d-43a6-aff1-b385fbc71f15", split: "train", chunk: 0 },
+            { clip_id: "1f47bf7f-d233-480c-b166-7512d8e9ac97", split: "train", chunk: 0 },
+            { clip_id: "c6915a10-9f22-464d-a422-15b8960a57d7", split: "train", chunk: 0 },
+            // Val clips
+            { clip_id: "030c760c-ae38-49aa-9ad8-f5650a545d26", split: "val", chunk: 100 },
+        ];
+
+        function getVideoUrl(clip_id, chunk) {
+            return `https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles/resolve/main/camera/${chunk}/${clip_id}.camera_front_wide_120fov.mp4`;
+        }
+
+        function copyClipId(clipId, btn) {
+            navigator.clipboard.writeText(clipId).then(() => {
+                btn.textContent = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = 'Copy Clip ID';
+                    btn.classList.remove('copied');
+                }, 2000);
+            });
+        }
+
+        function renderClips(filteredClips) {
+            const grid = document.getElementById('clipGrid');
+            grid.innerHTML = '';
+
+            filteredClips.forEach(clip => {
+                const card = document.createElement('div');
+                card.className = 'clip-card';
+                card.innerHTML = `
+                    <video controls preload="metadata" poster="">
+                        <source src="${getVideoUrl(clip.clip_id, clip.chunk)}" type="video/mp4">
+                        Video not available
+                    </video>
+                    <div class="clip-info">
+                        <div class="clip-id" onclick="copyClipId('${clip.clip_id}', this)" title="Click to copy">${clip.clip_id}</div>
+                        <div class="clip-meta">
+                            <span class="badge badge-${clip.split}">${clip.split}</span>
+                            <span class="badge" style="background:#f5f5f5;color:#666;">Chunk ${clip.chunk}</span>
+                        </div>
+                        <button class="copy-btn" onclick="copyClipId('${clip.clip_id}', this)">Copy Clip ID</button>
+                    </div>
+                `;
+                grid.appendChild(card);
+            });
+        }
+
+        function filterClips() {
+            const split = document.getElementById('splitFilter').value;
+            const chunk = document.getElementById('chunkFilter').value;
+
+            let filtered = clips;
+            if (split !== 'all') {
+                filtered = filtered.filter(c => c.split === split);
+            }
+            if (chunk) {
+                filtered = filtered.filter(c => c.chunk === parseInt(chunk));
+            }
+            renderClips(filtered);
+        }
+
+        // Initial render
+        filterClips();
+    </script>
+</body>
+</html>
