@@ -158,70 +158,97 @@ def validate_inputs(sample_bundle: Optional[Dict]) -> Tuple[bool, List[str]]:
 
 
 # ========== Official Mode Functions ==========
-def fetch_official_sidecars(clip_id: str) -> Dict[str, Any]:
+def fetch_official_sidecars(clip_id: str, chunk: int = None) -> Dict[str, Any]:
     """
-    Download sidecar data (calibration, timestamps, egomotion) for Official mode.
+    Download sidecar data (calibration, egomotion) for Official mode.
     Returns: {
         'calibration': Dict or None,
-        'egomotion': None (COMING SOON),
-        'timestamps': None (in camera chunks),
+        'egomotion': pd.DataFrame or None (GT trajectory),
         'available': bool,
         'errors': List[str]
     }
     """
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import hf_hub_download
+    import pandas as pd
+    import zipfile
+    import tempfile
 
     result = {
         'calibration': None,
         'egomotion': None,
-        'timestamps': None,
         'available': False,
         'errors': []
     }
 
-    # Check HF_TOKEN
     token = get_hf_token()
     if not token:
         result['errors'].append("HF_TOKEN required for Official dataset access")
         return result
 
+    # Get chunk number if not provided
+    if chunk is None:
+        try:
+            index_path = hf_hub_download(
+                repo_id=OFFICIAL_REPO_ID,
+                filename="clip_index.parquet",
+                repo_type="dataset",
+                token=token
+            )
+            index_df = pd.read_parquet(index_path)
+            if clip_id in index_df.index:
+                chunk = int(index_df.loc[clip_id, 'chunk'])
+            else:
+                result['errors'].append(f"clip_id {clip_id} not found in index")
+                return result
+        except Exception as e:
+            result['errors'].append(f"Failed to get chunk: {e}")
+            return result
+
     try:
-        # Try to access the official dataset
-        api = HfApi()
-        files = api.list_repo_files(OFFICIAL_REPO_ID, repo_type="dataset", token=token)
+        # Download calibration (camera_intrinsics)
+        try:
+            calib_filename = f"calibration/camera_intrinsics/camera_intrinsics.chunk_{chunk:04d}.parquet"
+            calib_path = hf_hub_download(
+                repo_id=OFFICIAL_REPO_ID,
+                filename=calib_filename,
+                repo_type="dataset",
+                token=token
+            )
+            calib_df = pd.read_parquet(calib_path)
+            if 'clip_id' in calib_df.columns:
+                clip_calib = calib_df[calib_df['clip_id'] == clip_id]
+                if len(clip_calib) > 0:
+                    result['calibration'] = clip_calib.to_dict('records')[0]
+            print(f"[OFFICIAL] Loaded calibration for chunk {chunk}")
+        except Exception as e:
+            result['errors'].append(f"calibration: {str(e)[:50]}")
 
-        # Look for calibration files
-        calib_files = [f for f in files if 'calibration' in f.lower() and f.endswith('.parquet')]
+        # Download egomotion (GT trajectory) - THIS IS AVAILABLE!
+        try:
+            ego_filename = f"labels/egomotion/egomotion.chunk_{chunk:04d}.zip"
+            print(f"[OFFICIAL] Downloading egomotion from {ego_filename}...")
+            ego_zip_path = hf_hub_download(
+                repo_id=OFFICIAL_REPO_ID,
+                filename=ego_filename,
+                repo_type="dataset",
+                token=token
+            )
 
-        if calib_files:
-            # Download calibration parquet
-            try:
-                import pandas as pd
-                calib_path = hf_hub_download(
-                    repo_id=OFFICIAL_REPO_ID,
-                    filename=calib_files[0],
-                    repo_type="dataset",
-                    token=token
-                )
-                calib_df = pd.read_parquet(calib_path)
-
-                # Filter for this clip_id if possible
-                if 'clip_id' in calib_df.columns:
-                    clip_calib = calib_df[calib_df['clip_id'] == clip_id]
-                    if len(clip_calib) > 0:
-                        result['calibration'] = clip_calib.to_dict('records')[0]
-                    else:
-                        result['calibration'] = calib_df.iloc[0].to_dict()
-                        result['errors'].append(f"clip_id {clip_id} not found in calibration, using first entry")
+            # Extract egomotion parquet from zip
+            ego_parquet_name = f"{clip_id}.egomotion.parquet"
+            with zipfile.ZipFile(ego_zip_path, 'r') as zf:
+                if ego_parquet_name in zf.namelist():
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        zf.extract(ego_parquet_name, tmpdir)
+                        ego_path = f"{tmpdir}/{ego_parquet_name}"
+                        result['egomotion'] = pd.read_parquet(ego_path)
+                        print(f"[OFFICIAL] Loaded egomotion: {len(result['egomotion'])} rows")
                 else:
-                    result['calibration'] = calib_df.iloc[0].to_dict() if len(calib_df) > 0 else None
+                    result['errors'].append(f"egomotion parquet not found in zip")
+        except Exception as e:
+            result['errors'].append(f"egomotion: {str(e)[:50]}")
 
-                result['available'] = result['calibration'] is not None
-            except Exception as e:
-                result['errors'].append(f"calibration download failed: {e}")
-
-        # egomotion is COMING SOON
-        result['egomotion'] = None
+        result['available'] = result['calibration'] is not None or result['egomotion'] is not None
 
     except Exception as e:
         result['errors'].append(f"Official dataset access error: {e}")
