@@ -2187,11 +2187,11 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
 
     # Mode switch handler
     def on_mode_change(mode):
-        """Toggle visibility of Official mode settings."""
+        """Toggle visibility of Official mode settings and update demo_mode value."""
         is_official = mode == "Official (Paper-Comparable)"
         return (
             gr.update(visible=is_official),  # official_group
-            gr.update(visible=not is_official),  # demo_mode_cb
+            gr.update(visible=not is_official, value=not is_official),  # demo_mode_cb: Official=False, Demo=True
             gr.update(visible=is_official),  # minade_output
             gr.update(visible=is_official),  # metric_status
         )
