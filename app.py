@@ -1872,8 +1872,7 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
             # Official mode specific inputs
             with gr.Group(visible=False) as official_group:
                 gr.Markdown("#### Official Mode Settings")
-                gr.Markdown("⚠️ **Step 1**: Enter clip_id and click 'Prepare Official Data' (slow, downloads ~4GB)")
-                gr.Markdown("⚠️ **Step 2**: After data is ready, click 'Run Inference'")
+                gr.Markdown("⚠️ **Step 1**: Enter clip_id → **Step 2**: Prepare Data → **Step 3**: Run Inference")
                 clip_id_input = gr.Textbox(
                     label="Clip ID (UUID)",
                     placeholder="e.g., 030c760c-ae38-49aa-9ad8-f5650a545d26",
@@ -1886,8 +1885,20 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                     precision=0,
                     info="Timestamp for trajectory prediction start"
                 )
-                prepare_official_btn = gr.Button("📥 Prepare Official Data (Step 1)", variant="secondary", size="lg")
-                official_data_status = gr.Markdown(value="No Official data prepared. Click 'Prepare Official Data' first.")
+                prepare_official_btn = gr.Button("📥 Prepare Official Data (downloads ~4GB)", variant="secondary", size="lg")
+                official_data_status = gr.Markdown(value="No Official data prepared.")
+
+                # Image preview for Official mode
+                gr.Markdown("#### Loaded Camera Images")
+                official_image_gallery = gr.Gallery(
+                    label="Camera Preview (4 cameras × 1 frame each)",
+                    columns=4,
+                    rows=1,
+                    height=200,
+                    object_fit="contain",
+                    show_label=True
+                )
+                official_data_summary = gr.Markdown(value="")
 
             gr.Markdown("### Driving Command")
             user_command = gr.Textbox(
@@ -1990,15 +2001,17 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
         """
         Prepare Official dataset data BEFORE GPU allocation.
         This avoids the 120-second timeout for large zip downloads.
+        Returns: bundle, status_msg, gallery_images, data_summary
         """
+        empty_gallery = []
+        empty_summary = ""
+
         if not clip_id or not clip_id.strip():
-            return None, "❌ Please enter a valid clip_id first."
+            return None, "❌ Please enter a valid clip_id first.", empty_gallery, empty_summary
 
         token = get_hf_token()
         if not token:
-            return None, "❌ HF_TOKEN is required. Please set it in Space secrets."
-
-        status_msg = f"⏳ Downloading data for clip_id: `{clip_id}`...\n\nThis may take several minutes (downloading ~4GB of video data)."
+            return None, "❌ HF_TOKEN is required. Please set it in Space secrets.", empty_gallery, empty_summary
 
         try:
             # Fetch images (this is the slow part - downloading zip files)
@@ -2026,33 +2039,57 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                     }
                 }
 
-                status_msg = f"""✅ **Official data ready!**
+                # Prepare gallery images (first frame from each camera)
+                camera_images = official_images['camera_images']
+                gallery_images = []
+                cam_labels = ['Front Wide', 'Cross Left', 'Cross Right', 'Rear Tele']
+                cam_keys = ['front_wide', 'cross_left', 'cross_right', 'rear_tele']
+                for i, cam_key in enumerate(cam_keys):
+                    if cam_key in camera_images and camera_images[cam_key]:
+                        img = camera_images[cam_key][0]  # First frame
+                        gallery_images.append((img, cam_labels[i]))
 
-**Clip ID**: `{clip_id}`
-**Chunk**: {official_images['chunk']}
-**Images**: {len(official_images['images'])} loaded
-**Calibration**: {'Available' if sidecars.get('calibration') else 'Not available'}
-**Egomotion**: {'Available' if sidecars.get('egomotion') is not None else 'COMING SOON'}
+                # Build data summary
+                calib_info = "Not available"
+                if sidecars.get('calibration'):
+                    calib_cams = list(sidecars['calibration'].keys()) if isinstance(sidecars['calibration'], dict) else []
+                    calib_info = f"Available ({len(calib_cams)} cameras)"
 
-👉 Now click **'Run Inference'** to process the data."""
+                ego_info = "COMING SOON"
+                if sidecars.get('egomotion') is not None:
+                    ego_len = len(sidecars['egomotion'])
+                    ego_info = f"Available ({ego_len} points)"
+
+                data_summary = f"""### Data Summary
+| Item | Value |
+|------|-------|
+| **Clip ID** | `{clip_id[:20]}...` |
+| **Chunk** | {official_images['chunk']} |
+| **Total Images** | {len(official_images['images'])} (4 cameras × 4 frames) |
+| **t0** | {t0_us / 1e6:.2f}s |
+| **Calibration** | {calib_info} |
+| **Egomotion (GT)** | {ego_info} |
+"""
+                status_msg = "✅ **Data ready!** Click 'Run Inference' to process."
 
                 if official_images['errors']:
-                    status_msg += f"\n\n⚠️ Warnings: {', '.join(official_images['errors'][:3])}"
+                    status_msg += f" ⚠️ {len(official_images['errors'])} warnings"
 
-                return bundle, status_msg
+                return bundle, status_msg, gallery_images, data_summary
             else:
                 errors = official_images.get('errors', ['Unknown error'])
-                return None, f"❌ Failed to load Official data:\n\n" + "\n".join(f"- {e}" for e in errors)
+                error_msg = "❌ Failed:\n" + "\n".join(f"- {e}" for e in errors[:3])
+                return None, error_msg, empty_gallery, empty_summary
 
         except Exception as e:
             import traceback
             print(f"[OFFICIAL PREPARE] Error: {traceback.format_exc()}")
-            return None, f"❌ Error preparing Official data: {str(e)}"
+            return None, f"❌ Error: {str(e)[:100]}", empty_gallery, empty_summary
 
     prepare_official_btn.click(
         fn=on_prepare_official_data,
         inputs=[clip_id_input, t0_us_input],
-        outputs=[state_official_data, official_data_status]
+        outputs=[state_official_data, official_data_status, official_image_gallery, official_data_summary]
     )
 
     def run_inference_wrapper(sample_bundle, user_command, num_samples, temperature, top_p,
