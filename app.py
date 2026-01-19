@@ -1819,10 +1819,13 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                 )
 
                 # Prepare model inputs
+                # ego_history_xyz shape: (B, n_traj_group, num_history_steps, 3)
+                # ego_history_rot shape: (B, n_traj_group, num_history_steps, 3, 3)
+                # Using zeros as placeholder since we don't have real egomotion history
                 model_inputs = {
                     "tokenized_data": {k: v.to(device) for k, v in inputs.items()},
-                    "ego_history_xyz": torch.zeros(1, 4, 3, device=device, dtype=torch.float32),
-                    "ego_history_rot": torch.zeros(1, 4, 4, device=device, dtype=torch.float32),
+                    "ego_history_xyz": torch.zeros(1, 1, 16, 3, device=device, dtype=torch.float32),
+                    "ego_history_rot": torch.zeros(1, 1, 16, 3, 3, device=device, dtype=torch.float32),
                 }
 
                 # Number of trajectory samples
