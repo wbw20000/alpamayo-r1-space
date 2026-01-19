@@ -260,8 +260,9 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
     """
     Download images from Official dataset for a specific clip_id.
 
-    Uses DIRECT URL access to individual mp4 files instead of downloading
-    entire zip archives (which are 1-2 GB each and cause timeouts).
+    Downloads zip files from HuggingFace Hub and extracts the specific video.
+    NOTE: This is a slow operation (zip files are 1-2 GB each).
+    Should be called OUTSIDE of GPU-decorated functions to avoid timeout.
 
     Args:
         clip_id: UUID of the clip
@@ -277,8 +278,8 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
     """
     from huggingface_hub import hf_hub_download
     import pandas as pd
+    import zipfile
     import tempfile
-    import urllib.request
 
     result = {
         'images': [],
@@ -312,9 +313,8 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
         result['chunk'] = chunk
         print(f"[OFFICIAL] Found clip in chunk {chunk}")
 
-        # Step 2: Download individual mp4 files using DIRECT URL
-        # This avoids downloading entire zip archives (1-2 GB each)
-        # URL format: camera/{chunk}/{clip_id}.{cam_name}.mp4
+        # Step 2: Download zip files and extract videos
+        # Camera mapping for Alpamayo (4 cameras)
         camera_names = {
             'front_wide': 'camera_front_wide_120fov',
             'cross_left': 'camera_cross_left_120fov',
@@ -325,95 +325,76 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
         all_images = []
         camera_images = {cam: [] for cam in camera_names.keys()}
 
-        # Base URL for direct file access
-        base_url = f"https://huggingface.co/datasets/{OFFICIAL_REPO_ID}/resolve/main"
-
         for cam_key, cam_name in camera_names.items():
             try:
-                # Direct URL to individual mp4 file
-                video_filename = f"{clip_id}.{cam_name}.mp4"
-                video_url = f"{base_url}/camera/{chunk}/{video_filename}"
-                print(f"[OFFICIAL] Downloading {cam_key}: {video_url[:80]}...")
+                # Download chunk zip file (uses HF cache, so subsequent calls are fast)
+                zip_filename = f"camera/{cam_name}/{cam_name}.chunk_{chunk:04d}.zip"
+                print(f"[OFFICIAL] Downloading {zip_filename}... (cached if already downloaded)")
 
-                # Download video to temp file with authentication
-                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
-                    tmp_path = tmp_file.name
+                zip_path = hf_hub_download(
+                    repo_id=OFFICIAL_REPO_ID,
+                    filename=zip_filename,
+                    repo_type="dataset",
+                    token=token
+                )
+                print(f"[OFFICIAL] Got zip for {cam_key}: {zip_path}")
 
-                    # Create request with auth header
-                    request = urllib.request.Request(video_url)
-                    request.add_header('Authorization', f'Bearer {token}')
-
-                    try:
-                        with urllib.request.urlopen(request, timeout=60) as response:
-                            tmp_file.write(response.read())
-                        print(f"[OFFICIAL] Downloaded {cam_key} successfully")
-                    except urllib.error.HTTPError as http_err:
-                        if http_err.code == 404:
-                            result['errors'].append(f"{cam_key}: video not found (404)")
-                        else:
-                            result['errors'].append(f"{cam_key}: HTTP {http_err.code}")
+                # Extract video from zip
+                video_name = f"{clip_id}.{cam_name}.mp4"
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    if video_name not in zf.namelist():
+                        result['errors'].append(f"{cam_key}: video {video_name} not in zip")
                         # Use placeholder images
                         for _ in range(FRAMES_PER_CAMERA):
                             placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
                             camera_images[cam_key].append(placeholder)
                             all_images.append(placeholder)
                         continue
-                    except Exception as dl_err:
-                        result['errors'].append(f"{cam_key}: download failed - {str(dl_err)[:30]}")
-                        for _ in range(FRAMES_PER_CAMERA):
-                            placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
-                            camera_images[cam_key].append(placeholder)
-                            all_images.append(placeholder)
-                        continue
 
-                # Extract frames from video using cv2
-                try:
-                    import cv2
-                    cap = cv2.VideoCapture(tmp_path)
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    # Extract video to temp file
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        zf.extract(video_name, tmpdir)
+                        video_path = f"{tmpdir}/{video_name}"
 
-                    # Calculate frame indices for 4 frames at 2Hz (0.5s apart)
-                    start_frame = int((t0_us / 1e6) * fps) if fps > 0 else 0
-                    frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
+                        # Extract frames from video using cv2
+                        try:
+                            import cv2
+                            cap = cv2.VideoCapture(video_path)
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-                    frames_extracted = []
-                    for i in range(FRAMES_PER_CAMERA):
-                        frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        ret, frame = cap.read()
-                        if ret:
-                            # Convert BGR to RGB
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            img = Image.fromarray(frame_rgb)
-                            frames_extracted.append(img)
-                        else:
-                            # Use placeholder if frame read fails
-                            frames_extracted.append(Image.new('RGB', (1920, 1080), color=(100, 100, 100)))
+                            # Calculate frame indices for 4 frames at 2Hz (0.5s apart)
+                            start_frame = int((t0_us / 1e6) * fps) if fps > 0 else 0
+                            frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
 
-                    cap.release()
+                            frames_extracted = []
+                            for i in range(FRAMES_PER_CAMERA):
+                                frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                                ret, frame = cap.read()
+                                if ret:
+                                    # Convert BGR to RGB
+                                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    img = Image.fromarray(frame_rgb)
+                                    frames_extracted.append(img)
+                                else:
+                                    frames_extracted.append(Image.new('RGB', (1920, 1080), color=(100, 100, 100)))
 
-                    camera_images[cam_key] = frames_extracted
-                    all_images.extend(frames_extracted)
-                    print(f"[OFFICIAL] Extracted {len(frames_extracted)} frames from {cam_key}")
+                            cap.release()
 
-                except ImportError:
-                    result['errors'].append("cv2 not available for video extraction")
-                    for _ in range(FRAMES_PER_CAMERA):
-                        placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
-                        camera_images[cam_key].append(placeholder)
-                        all_images.append(placeholder)
-                finally:
-                    # Clean up temp file
-                    try:
-                        import os
-                        os.unlink(tmp_path)
-                    except:
-                        pass
+                            camera_images[cam_key] = frames_extracted
+                            all_images.extend(frames_extracted)
+                            print(f"[OFFICIAL] Extracted {len(frames_extracted)} frames from {cam_key}")
+
+                        except ImportError:
+                            result['errors'].append("cv2 not available")
+                            for _ in range(FRAMES_PER_CAMERA):
+                                placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
+                                camera_images[cam_key].append(placeholder)
+                                all_images.append(placeholder)
 
             except Exception as cam_err:
                 result['errors'].append(f"{cam_key}: {str(cam_err)[:50]}")
-                # Use placeholders for this camera
                 for _ in range(FRAMES_PER_CAMERA):
                     placeholder = Image.new('RGB', (1920, 1080), color=(128, 128, 128))
                     camera_images[cam_key].append(placeholder)
@@ -1434,43 +1415,55 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
     minade_value = None
     metric_status_text = ""
 
-    # For Official mode, fetch sidecar data AND images from Official dataset
+    # For Official mode, use pre-downloaded data OR fetch new data
     if is_official_mode:
-        print(f"[OFFICIAL] Fetching data for clip_id: {clip_id}")
-
-        # Fetch sidecars (calibration, etc.)
-        sidecars = fetch_official_sidecars(clip_id.strip())
-        if sidecars['errors']:
-            print(f"[OFFICIAL] Sidecar errors: {sidecars['errors']}")
-
-        # Fetch images from Official dataset (this is the key change!)
-        print(f"[OFFICIAL] Fetching images from Official dataset...")
-        official_images = fetch_official_images(clip_id.strip(), t0_us)
-
-        if official_images['available']:
-            # Use images from Official dataset
-            images = official_images['images']
-            camera_images = official_images['camera_images']
-            meta = {
-                'source': 'official_dataset',
-                'sample_id': clip_id,
-                'chunk': official_images['chunk'],
-                'notes': [f'Official dataset - chunk {official_images["chunk"]}'],
-                'degraded': False
-            }
-            if official_images['errors']:
-                meta['notes'].extend(official_images['errors'])
-            print(f"[OFFICIAL] Successfully loaded {len(images)} images from Official dataset")
+        # Check if sample_bundle contains pre-downloaded Official data
+        if sample_bundle is not None and sample_bundle.get('clip_id') and sample_bundle.get('images'):
+            print(f"[OFFICIAL] Using PRE-DOWNLOADED data for clip_id: {sample_bundle.get('clip_id')}")
+            images = sample_bundle['images']
+            camera_images = sample_bundle.get('camera_images', {})
+            meta = sample_bundle.get('meta', {})
+            sidecars = sample_bundle.get('sidecars', {})
+            clip_id = sample_bundle.get('clip_id', clip_id)
+            print(f"[OFFICIAL] Pre-downloaded data: {len(images)} images")
         else:
-            # Official dataset images not available - report errors
-            error_msgs = official_images.get('errors', ['Unknown error'])
-            meta = {
-                'source': 'official_mode_failed',
-                'sample_id': clip_id,
-                'notes': ['Failed to load Official dataset images'] + error_msgs,
-                'degraded': True
-            }
-            print(f"[OFFICIAL] Failed to load images: {error_msgs}")
+            # No pre-downloaded data, need to fetch (will likely timeout on ZeroGPU)
+            print(f"[OFFICIAL] No pre-downloaded data, fetching for clip_id: {clip_id}")
+            print(f"[OFFICIAL] ⚠️ WARNING: This may timeout. Use 'Prepare Official Data' button first!")
+
+            # Fetch sidecars (calibration, etc.)
+            sidecars = fetch_official_sidecars(clip_id.strip())
+            if sidecars['errors']:
+                print(f"[OFFICIAL] Sidecar errors: {sidecars['errors']}")
+
+            # Fetch images from Official dataset
+            print(f"[OFFICIAL] Fetching images from Official dataset...")
+            official_images = fetch_official_images(clip_id.strip(), t0_us)
+
+            if official_images['available']:
+                # Use images from Official dataset
+                images = official_images['images']
+                camera_images = official_images['camera_images']
+                meta = {
+                    'source': 'official_dataset',
+                    'sample_id': clip_id,
+                    'chunk': official_images['chunk'],
+                    'notes': [f'Official dataset - chunk {official_images["chunk"]}'],
+                    'degraded': False
+                }
+                if official_images['errors']:
+                    meta['notes'].extend(official_images['errors'])
+                print(f"[OFFICIAL] Successfully loaded {len(images)} images from Official dataset")
+            else:
+                # Official dataset images not available - report errors
+                error_msgs = official_images.get('errors', ['Unknown error'])
+                meta = {
+                    'source': 'official_mode_failed',
+                    'sample_id': clip_id,
+                    'notes': ['Failed to load Official dataset images'] + error_msgs,
+                    'degraded': True
+                }
+                print(f"[OFFICIAL] Failed to load images: {error_msgs}")
     else:
         # Demo mode - use sample bundle
         images = sample_bundle.get("images", [])
@@ -1819,6 +1812,8 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
     state_sample = gr.State(value=None)
     state_sample_pool = gr.State(value=[])
     state_sample_idx = gr.State(value=0)
+    # State for Official mode pre-downloaded data
+    state_official_data = gr.State(value=None)
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1853,6 +1848,8 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
             # Official mode specific inputs
             with gr.Group(visible=False) as official_group:
                 gr.Markdown("#### Official Mode Settings")
+                gr.Markdown("⚠️ **Step 1**: Enter clip_id and click 'Prepare Official Data' (slow, downloads ~4GB)")
+                gr.Markdown("⚠️ **Step 2**: After data is ready, click 'Run Inference'")
                 clip_id_input = gr.Textbox(
                     label="Clip ID (UUID)",
                     placeholder="e.g., 030c760c-ae38-49aa-9ad8-f5650a545d26",
@@ -1865,6 +1862,8 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                     precision=0,
                     info="Timestamp for trajectory prediction start"
                 )
+                prepare_official_btn = gr.Button("📥 Prepare Official Data (Step 1)", variant="secondary", size="lg")
+                official_data_status = gr.Markdown(value="No Official data prepared. Click 'Prepare Official Data' first.")
 
             gr.Markdown("### Driving Command")
             user_command = gr.Textbox(
@@ -1963,9 +1962,83 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
         outputs=[state_sample, sample_status, state_sample_pool, state_sample_idx]
     )
 
+    def on_prepare_official_data(clip_id, t0_us):
+        """
+        Prepare Official dataset data BEFORE GPU allocation.
+        This avoids the 120-second timeout for large zip downloads.
+        """
+        if not clip_id or not clip_id.strip():
+            return None, "❌ Please enter a valid clip_id first."
+
+        token = get_hf_token()
+        if not token:
+            return None, "❌ HF_TOKEN is required. Please set it in Space secrets."
+
+        status_msg = f"⏳ Downloading data for clip_id: `{clip_id}`...\n\nThis may take several minutes (downloading ~4GB of video data)."
+
+        try:
+            # Fetch images (this is the slow part - downloading zip files)
+            print(f"[OFFICIAL PREPARE] Starting download for {clip_id}")
+            official_images = fetch_official_images(clip_id.strip(), t0_us)
+
+            if official_images['available']:
+                # Also fetch sidecars
+                sidecars = fetch_official_sidecars(clip_id.strip(), official_images['chunk'])
+
+                # Build bundle
+                bundle = {
+                    'images': official_images['images'],
+                    'camera_images': official_images['camera_images'],
+                    'chunk': official_images['chunk'],
+                    'sidecars': sidecars,
+                    'clip_id': clip_id.strip(),
+                    't0_us': t0_us,
+                    'meta': {
+                        'source': 'official_dataset',
+                        'sample_id': clip_id,
+                        'chunk': official_images['chunk'],
+                        'degraded': False,
+                        'notes': []
+                    }
+                }
+
+                status_msg = f"""✅ **Official data ready!**
+
+**Clip ID**: `{clip_id}`
+**Chunk**: {official_images['chunk']}
+**Images**: {len(official_images['images'])} loaded
+**Calibration**: {'Available' if sidecars.get('calibration') else 'Not available'}
+**Egomotion**: {'Available' if sidecars.get('egomotion') is not None else 'COMING SOON'}
+
+👉 Now click **'Run Inference'** to process the data."""
+
+                if official_images['errors']:
+                    status_msg += f"\n\n⚠️ Warnings: {', '.join(official_images['errors'][:3])}"
+
+                return bundle, status_msg
+            else:
+                errors = official_images.get('errors', ['Unknown error'])
+                return None, f"❌ Failed to load Official data:\n\n" + "\n".join(f"- {e}" for e in errors)
+
+        except Exception as e:
+            import traceback
+            print(f"[OFFICIAL PREPARE] Error: {traceback.format_exc()}")
+            return None, f"❌ Error preparing Official data: {str(e)}"
+
+    prepare_official_btn.click(
+        fn=on_prepare_official_data,
+        inputs=[clip_id_input, t0_us_input],
+        outputs=[state_official_data, official_data_status]
+    )
+
     def run_inference_wrapper(sample_bundle, user_command, num_samples, temperature, top_p,
-                               demo_mode, inference_mode, clip_id, t0_us):
+                               demo_mode, inference_mode, clip_id, t0_us, official_data):
         """Wrapper to handle different modes and return appropriate outputs."""
+        # For Official mode, use pre-downloaded data if available
+        if inference_mode == "Official (Paper-Comparable)" and official_data is not None:
+            # Pass the pre-downloaded official data as sample_bundle
+            sample_bundle = official_data
+
         result = run_inference(
             sample_bundle, user_command, num_samples, temperature, top_p,
             demo_mode, inference_mode, clip_id, t0_us
@@ -1983,7 +2056,7 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
     run_btn.click(
         fn=run_inference_wrapper,
         inputs=[state_sample, user_command, num_samples, temperature, top_p,
-                demo_mode_cb, inference_mode, clip_id_input, t0_us_input],
+                demo_mode_cb, inference_mode, clip_id_input, t0_us_input, state_official_data],
         outputs=[reasoning_output, trajectory_output, status_output, minade_output, metric_status]
     )
 
