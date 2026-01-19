@@ -215,7 +215,21 @@ def fetch_official_sidecars(clip_id: str, chunk: int = None) -> Dict[str, Any]:
                 token=token
             )
             calib_df = pd.read_parquet(calib_path)
-            if 'clip_id' in calib_df.columns:
+
+            # Calibration parquet uses MultiIndex: (clip_id, camera_name)
+            # Check if clip_id is in index
+            if calib_df.index.nlevels >= 2:
+                # MultiIndex case
+                clip_ids_in_index = calib_df.index.get_level_values(0).unique()
+                if clip_id in clip_ids_in_index:
+                    clip_calib = calib_df.loc[clip_id]
+                    # Convert to dict with camera_name as key
+                    result['calibration'] = {}
+                    for cam_name in clip_calib.index:
+                        result['calibration'][cam_name] = clip_calib.loc[cam_name].to_dict()
+                    print(f"[OFFICIAL] Loaded calibration for {len(result['calibration'])} cameras")
+            elif 'clip_id' in calib_df.columns:
+                # Fallback: clip_id as column
                 clip_calib = calib_df[calib_df['clip_id'] == clip_id]
                 if len(clip_calib) > 0:
                     result['calibration'] = clip_calib.to_dict('records')[0]
@@ -1686,28 +1700,38 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
             cam_extrinsic = None
             cam_intrinsic = None
             if sidecars and sidecars.get('calibration'):
-                calib = sidecars['calibration']
-                # Extract camera parameters if available
-                cam_extrinsic = {
-                    'qx': calib.get('qx', 0),
-                    'qy': calib.get('qy', 0),
-                    'qz': calib.get('qz', 0),
-                    'qw': calib.get('qw', 1),
-                    'x': calib.get('x', 0),
-                    'y': calib.get('y', 0),
-                    'z': calib.get('z', 1.5),
-                }
-                cam_intrinsic = {
-                    'cx': calib.get('cx', front_camera_image.size[0] / 2),
-                    'cy': calib.get('cy', front_camera_image.size[1] / 2),
-                    'width': calib.get('width', front_camera_image.size[0]),
-                    'height': calib.get('height', front_camera_image.size[1]),
-                    'fw_poly_0': calib.get('fw_poly_0', 0),
-                    'fw_poly_1': calib.get('fw_poly_1', 500),
-                    'fw_poly_2': calib.get('fw_poly_2', 0),
-                    'fw_poly_3': calib.get('fw_poly_3', 0),
-                    'fw_poly_4': calib.get('fw_poly_4', 0),
-                }
+                calib_data = sidecars['calibration']
+                # New format: calibration is dict with camera_name as key
+                # Try to get front_wide camera calibration
+                calib = None
+                if isinstance(calib_data, dict):
+                    # Look for front_wide camera
+                    for cam_key in ['camera_front_wide_120fov', 'front_wide', 'camera_front_wide']:
+                        if cam_key in calib_data:
+                            calib = calib_data[cam_key]
+                            break
+                    # If not found, use first available camera
+                    if calib is None and len(calib_data) > 0:
+                        first_key = list(calib_data.keys())[0]
+                        if isinstance(calib_data[first_key], dict):
+                            calib = calib_data[first_key]
+                        else:
+                            calib = calib_data  # Old format: flat dict
+
+                if calib:
+                    # Extract camera parameters (intrinsics only for f-theta model)
+                    cam_intrinsic = {
+                        'cx': calib.get('cx', front_camera_image.size[0] / 2),
+                        'cy': calib.get('cy', front_camera_image.size[1] / 2),
+                        'width': calib.get('width', front_camera_image.size[0]),
+                        'height': calib.get('height', front_camera_image.size[1]),
+                        'fw_poly_0': calib.get('fw_poly_0', 0),
+                        'fw_poly_1': calib.get('fw_poly_1', 500),
+                        'fw_poly_2': calib.get('fw_poly_2', 0),
+                        'fw_poly_3': calib.get('fw_poly_3', 0),
+                        'fw_poly_4': calib.get('fw_poly_4', 0),
+                    }
+                    print(f"[VIS] Using calibration: cx={cam_intrinsic['cx']:.1f}, cy={cam_intrinsic['cy']:.1f}")
 
             # Project trajectory to 2D
             traj_2d = project_trajectory_to_camera(
