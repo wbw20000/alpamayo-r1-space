@@ -338,6 +338,68 @@ def analyze_egomotion(ego_df) -> Dict[str, bool]:
     return result
 
 
+def extract_gt_trajectory_from_egomotion(ego_df, t0_us: float, duration: float = 6.4, num_points: int = 64):
+    """
+    Extract ground truth trajectory from egomotion data.
+
+    Args:
+        ego_df: pandas DataFrame with egomotion data (timestamp, vx, vy, etc.)
+        t0_us: Starting timestamp in microseconds
+        duration: Trajectory duration in seconds (default 6.4s)
+        num_points: Number of trajectory points (default 64 for 10Hz)
+
+    Returns:
+        np.array of shape (num_points, 3) with x, y, z coordinates
+    """
+    try:
+        if ego_df is None or len(ego_df) < 10:
+            return None
+
+        # Get timestamps and velocities
+        timestamps = ego_df['timestamp'].values  # in microseconds
+        vx = ego_df['vx'].values if 'vx' in ego_df.columns else np.zeros(len(ego_df))
+        vy = ego_df['vy'].values if 'vy' in ego_df.columns else np.zeros(len(ego_df))
+
+        # Find data within the time range [t0_us, t0_us + duration*1e6]
+        t_end_us = t0_us + duration * 1e6
+        mask = (timestamps >= t0_us) & (timestamps <= t_end_us)
+
+        if np.sum(mask) < 10:
+            print(f"[GT] Not enough egomotion data in range: {np.sum(mask)} points")
+            return None
+
+        t_rel = (timestamps[mask] - t0_us) / 1e6  # Convert to seconds, relative to t0
+        vx_range = vx[mask]
+        vy_range = vy[mask]
+
+        # Integrate velocities to get positions
+        # x(t) = integral(vx dt), y(t) = integral(vy dt)
+        dt = np.diff(t_rel)
+        x = np.zeros(len(t_rel))
+        y = np.zeros(len(t_rel))
+
+        for i in range(1, len(t_rel)):
+            x[i] = x[i-1] + vx_range[i-1] * dt[i-1]
+            y[i] = y[i-1] + vy_range[i-1] * dt[i-1]
+
+        # Interpolate to get exactly num_points at uniform intervals
+        t_target = np.linspace(0, duration, num_points)
+        x_interp = np.interp(t_target, t_rel, x)
+        y_interp = np.interp(t_target, t_rel, y)
+
+        # Build trajectory (x, y, z=0)
+        trajectory = np.zeros((num_points, 3))
+        trajectory[:, 0] = x_interp
+        trajectory[:, 1] = y_interp
+
+        print(f"[GT] Extracted GT trajectory: {num_points} points, final pos: ({x_interp[-1]:.2f}, {y_interp[-1]:.2f})")
+        return trajectory
+
+    except Exception as e:
+        print(f"[GT] Error extracting GT trajectory: {e}")
+        return None
+
+
 def filter_clips_by_scenario(
     scenarios: List[str],
     split: str = "val",
@@ -492,6 +554,7 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
         'images': [],
         'camera_images': {},
         'chunk': None,
+        'timestamps': [],  # Real timestamps for each frame
         'available': False,
         'errors': []
     }
@@ -575,8 +638,13 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
                             frame_interval = int(fps / 2) if fps > 0 else 15  # 2Hz
 
                             frames_extracted = []
+                            frame_timestamps = []
                             for i in range(FRAMES_PER_CAMERA):
                                 frame_idx = min(start_frame + i * frame_interval, total_frames - 1)
+                                # Calculate real timestamp for this frame
+                                timestamp_sec = frame_idx / fps if fps > 0 else t0_us / 1e6 + i * 0.5
+                                frame_timestamps.append(timestamp_sec)
+
                                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                                 ret, frame = cap.read()
                                 if ret:
@@ -588,6 +656,11 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
                                     frames_extracted.append(Image.new('RGB', (1920, 1080), color=(100, 100, 100)))
 
                             cap.release()
+
+                            # Save timestamps (only once, from first camera)
+                            if not result['timestamps'] and frame_timestamps:
+                                result['timestamps'] = frame_timestamps
+                                print(f"[OFFICIAL] Extracted timestamps: {[f'{t:.2f}s' for t in frame_timestamps]}")
 
                             camera_images[cam_key] = frames_extracted
                             all_images.extend(frames_extracted)
@@ -1632,7 +1705,8 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
             meta = sample_bundle.get('meta', {})
             sidecars = sample_bundle.get('sidecars', {})
             clip_id = sample_bundle.get('clip_id', clip_id)
-            print(f"[OFFICIAL] Pre-downloaded data: {len(images)} images")
+            timestamps = sample_bundle.get('timestamps', [])  # Real frame timestamps
+            print(f"[OFFICIAL] Pre-downloaded data: {len(images)} images, timestamps: {len(timestamps)}")
         else:
             # No pre-downloaded data, need to fetch (will likely timeout on ZeroGPU)
             print(f"[OFFICIAL] No pre-downloaded data, fetching for clip_id: {clip_id}")
@@ -1651,6 +1725,7 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                 # Use images from Official dataset
                 images = official_images['images']
                 camera_images = official_images['camera_images']
+                timestamps = official_images.get('timestamps', [])  # Real frame timestamps
                 meta = {
                     'source': 'official_dataset',
                     'sample_id': clip_id,
@@ -1660,10 +1735,11 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                 }
                 if official_images['errors']:
                     meta['notes'].extend(official_images['errors'])
-                print(f"[OFFICIAL] Successfully loaded {len(images)} images from Official dataset")
+                print(f"[OFFICIAL] Successfully loaded {len(images)} images, timestamps: {len(timestamps)}")
             else:
                 # Official dataset images not available - report errors
                 error_msgs = official_images.get('errors', ['Unknown error'])
+                timestamps = []  # No timestamps available
                 meta = {
                     'source': 'official_mode_failed',
                     'sample_id': clip_id,
@@ -1676,6 +1752,7 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
         images = sample_bundle.get("images", [])
         camera_images = sample_bundle.get("camera_images", {})
         meta = sample_bundle.get("meta", {})
+        timestamps = sample_bundle.get("timestamps", []) if sample_bundle else []
 
         if len(images) != TOTAL_IMAGES:
             return (f"Invalid sample: expected {TOTAL_IMAGES} images, got {len(images)}", None, "Error: Invalid sample", None, "")
@@ -1721,12 +1798,15 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
             try:
                 from alpamayo_r1 import helper
 
-                # Prepare images tensor: need (16,) list of PIL images -> tensor
+                # Prepare images tensor: need (16,) list of PIL images -> tensor (N, C, H, W)
                 # Images should be in order: 4 cameras x 4 frames
-                image_list = images  # Already a list of PIL images
+                # Convert PIL images to tensor: (16, H, W, 3) -> (16, 3, H, W)
+                images_np = np.array([np.array(img) for img in images])  # (16, H, W, 3)
+                images_tensor = torch.from_numpy(images_np).permute(0, 3, 1, 2).float()  # (16, 3, H, W)
+                print(f"[INFERENCE] Images tensor shape: {images_tensor.shape}")
 
-                # Create message with images
-                messages = helper.create_message(image_list)
+                # Create message with images tensor
+                messages = helper.create_message(images_tensor)
 
                 # Apply chat template
                 inputs = processor.apply_chat_template(
@@ -1774,10 +1854,27 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                     # Official mode: use all samples for minADE calculation
                     pred_trajectories = pred_np[0, 0]  # (n_samples, 64, 3)
 
-                    # For now, use synthetic GT since egomotion is COMING SOON
-                    gt_trajectory = np.zeros((64, 3))
-                    gt_trajectory[:, 0] = t * 5.0
-                    gt_trajectory[:, 1] = 0.3 * np.sin(t * 0.5)
+                    # Try to use real egomotion data for GT trajectory
+                    gt_source = "synthetic"
+                    if sidecars and sidecars.get('egomotion') is not None:
+                        ego_df = sidecars['egomotion']
+                        real_gt = extract_gt_trajectory_from_egomotion(ego_df, t0_us)
+                        if real_gt is not None:
+                            gt_trajectory = real_gt
+                            gt_source = "real"
+                            print(f"[INFERENCE] Using REAL GT trajectory from egomotion")
+                        else:
+                            # Fallback to synthetic
+                            gt_trajectory = np.zeros((64, 3))
+                            gt_trajectory[:, 0] = t * 5.0
+                            gt_trajectory[:, 1] = 0.3 * np.sin(t * 0.5)
+                            print(f"[INFERENCE] Fallback to synthetic GT (egomotion extraction failed)")
+                    else:
+                        # No egomotion data, use synthetic GT
+                        gt_trajectory = np.zeros((64, 3))
+                        gt_trajectory[:, 0] = t * 5.0
+                        gt_trajectory[:, 1] = 0.3 * np.sin(t * 0.5)
+                        print(f"[INFERENCE] Using synthetic GT (no egomotion data)")
 
                     # Compute minADE6
                     gt_xy = gt_trajectory[:, :2].T  # (2, 64)
@@ -1787,13 +1884,14 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                     best_idx = int(diff.argmin())
                     trajectory = pred_trajectories[best_idx]
 
-                    metric_status_text = f"REAL INFERENCE (minADE6={minade_value:.4f}m, synthetic GT)"
+                    gt_label = "real egomotion" if gt_source == "real" else "synthetic"
+                    metric_status_text = f"REAL INFERENCE (minADE6={minade_value:.4f}m, {gt_label} GT)"
                     mode_status = "## Official Mode - REAL Inference"
                     mode_reason = f"Using clip_id: {clip_id} with {n_samples} trajectory samples"
-                    trajectory_note = f"**REAL MODEL OUTPUT** - minADE6@6.4s: {minade_value:.4f} m (best of {n_samples} samples, synthetic GT)"
+                    trajectory_note = f"**REAL MODEL OUTPUT** - minADE6@6.4s: {minade_value:.4f} m (best of {n_samples} samples, {gt_label} GT)"
                     notes.append("Model inference: REAL (not synthetic)")
                     notes.append(f"Trajectory samples: {n_samples}")
-                    notes.append("Ground truth: Synthetic (egomotion COMING SOON)")
+                    notes.append(f"Ground truth: {gt_label.capitalize()}")
                 else:
                     # Non-official mode: use first sample
                     trajectory = pred_np[0, 0, 0]  # (64, 3)
@@ -1968,8 +2066,8 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
 
 ### Data Availability
 - **Calibration**: {'Available' if (sidecars and sidecars.get('calibration')) else 'Not available'}
-- **Ego Motion**: {'COMING SOON' if is_official_mode else ('Available' if meta.get('ego_motion') else 'Missing')}
-- **Timestamps**: {'Available' if (sidecars and sidecars.get('timestamps')) else 'Placeholder'}
+- **Ego Motion**: {'Available (' + str(len(sidecars.get('egomotion', []))) + ' points)' if (sidecars and sidecars.get('egomotion') is not None) else 'Not available'}
+- **Timestamps**: {'Available (' + str(len(timestamps)) + ' frames)' if timestamps else 'Placeholder'}
 
 ### Notes
 {chr(10).join('- ' + n for n in notes) if notes else '- Standard input'}
@@ -2295,6 +2393,7 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                     'sidecars': sidecars,
                     'clip_id': clip_id.strip(),
                     't0_us': t0_us,
+                    'timestamps': official_images.get('timestamps', []),  # Real frame timestamps
                     'meta': {
                         'source': 'official_dataset',
                         'sample_id': clip_id,
@@ -2320,10 +2419,15 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                     calib_cams = list(sidecars['calibration'].keys()) if isinstance(sidecars['calibration'], dict) else []
                     calib_info = f"Available ({len(calib_cams)} cameras)"
 
-                ego_info = "COMING SOON"
+                ego_info = "Not available"
                 if sidecars.get('egomotion') is not None:
                     ego_len = len(sidecars['egomotion'])
                     ego_info = f"Available ({ego_len} points)"
+
+                timestamps_info = "Placeholder"
+                if official_images.get('timestamps'):
+                    ts = official_images['timestamps']
+                    timestamps_info = f"Available ({len(ts)} frames, {ts[0]:.2f}s - {ts[-1]:.2f}s)"
 
                 data_summary = f"""### Data Summary
 | Item | Value |
@@ -2334,6 +2438,7 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
 | **t0** | {t0_us / 1e6:.2f}s |
 | **Calibration** | {calib_info} |
 | **Egomotion (GT)** | {ego_info} |
+| **Timestamps** | {timestamps_info} |
 """
                 status_msg = "✅ **Data ready!** Click 'Run Inference' to process."
 
