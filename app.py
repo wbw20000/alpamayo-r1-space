@@ -1822,32 +1822,29 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                 # ego_history_xyz shape: (B, n_traj_group, num_history_steps, 3)
                 # ego_history_rot shape: (B, n_traj_group, num_history_steps, 3, 3)
                 # Using zeros as placeholder since we don't have real egomotion history
-                # Must use bfloat16 to match model weights
+                # Use float32 for inputs - model will handle dtype conversion internally
 
-                # Convert tokenized_data tensors to device, and float tensors to bfloat16
+                # Convert tokenized_data tensors to device (keep float32 for compatibility)
                 tokenized_data = {}
                 for k, v in inputs.items():
                     if isinstance(v, torch.Tensor):
-                        v = v.to(device)
-                        # Convert float tensors (like pixel_values) to bfloat16
-                        if v.dtype == torch.float32:
-                            v = v.to(torch.bfloat16)
-                        tokenized_data[k] = v
+                        tokenized_data[k] = v.to(device)
                     else:
                         tokenized_data[k] = v
 
                 model_inputs = {
                     "tokenized_data": tokenized_data,
-                    "ego_history_xyz": torch.zeros(1, 1, 16, 3, device=device, dtype=torch.bfloat16),
-                    "ego_history_rot": torch.zeros(1, 1, 16, 3, 3, device=device, dtype=torch.bfloat16),
+                    "ego_history_xyz": torch.zeros(1, 1, 16, 3, device=device, dtype=torch.float32),
+                    "ego_history_rot": torch.zeros(1, 1, 16, 3, 3, device=device, dtype=torch.float32),
                 }
 
                 # Number of trajectory samples
                 n_samples = num_samples if is_official_mode else 1
                 print(f"[INFERENCE] Generating {n_samples} trajectory samples...")
 
-                # Run model inference with autocast for bfloat16
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                # Run model inference - use autocast for VLM forward pass only
+                # Note: diffusion sampling uses operations like cholesky that require float32
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                         data=model_inputs,
                         top_p=top_p,
