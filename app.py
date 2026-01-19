@@ -1823,8 +1823,21 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                 # ego_history_rot shape: (B, n_traj_group, num_history_steps, 3, 3)
                 # Using zeros as placeholder since we don't have real egomotion history
                 # Must use bfloat16 to match model weights
+
+                # Convert tokenized_data tensors to device, and float tensors to bfloat16
+                tokenized_data = {}
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        v = v.to(device)
+                        # Convert float tensors (like pixel_values) to bfloat16
+                        if v.dtype == torch.float32:
+                            v = v.to(torch.bfloat16)
+                        tokenized_data[k] = v
+                    else:
+                        tokenized_data[k] = v
+
                 model_inputs = {
-                    "tokenized_data": {k: v.to(device) for k, v in inputs.items()},
+                    "tokenized_data": tokenized_data,
                     "ego_history_xyz": torch.zeros(1, 1, 16, 3, device=device, dtype=torch.bfloat16),
                     "ego_history_rot": torch.zeros(1, 1, 16, 3, 3, device=device, dtype=torch.bfloat16),
                 }
