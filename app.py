@@ -1846,8 +1846,8 @@ def run_inference_impl(sample_bundle: Optional[Dict], user_command: str, num_sam
                 n_samples = num_samples if is_official_mode else 1
                 print(f"[INFERENCE] Generating {n_samples} trajectory samples...")
 
-                # Run model inference
-                with torch.no_grad():
+                # Run model inference with autocast for bfloat16
+                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
                         data=model_inputs,
                         top_p=top_p,
