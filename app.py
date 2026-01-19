@@ -270,6 +270,199 @@ def fetch_official_sidecars(clip_id: str, chunk: int = None) -> Dict[str, Any]:
     return result
 
 
+def analyze_egomotion(ego_df) -> Dict[str, bool]:
+    """
+    Analyze egomotion data to detect driving scenarios.
+
+    Args:
+        ego_df: pandas DataFrame with egomotion data (ax, vy, curvature, etc.)
+
+    Returns:
+        Dict with scenario flags: {
+            'sudden_acceleration': bool,
+            'hard_braking': bool,
+            'left_turn': bool,
+            'right_turn': bool,
+            'u_turn': bool,
+            'lane_change': bool
+        }
+    """
+    import pandas as pd
+
+    result = {
+        'sudden_acceleration': False,
+        'hard_braking': False,
+        'left_turn': False,
+        'right_turn': False,
+        'u_turn': False,
+        'lane_change': False
+    }
+
+    if ego_df is None or len(ego_df) < 10:
+        return result
+
+    try:
+        # 1. Acceleration/Braking detection (ax)
+        if 'ax' in ego_df.columns:
+            ax = ego_df['ax'].values
+            result['sudden_acceleration'] = bool(np.max(ax) > 2.5)  # m/s^2
+            result['hard_braking'] = bool(np.min(ax) < -3.0)  # m/s^2
+
+        # 2. Turn detection (curvature)
+        if 'curvature' in ego_df.columns:
+            curvature = ego_df['curvature'].values
+            mean_curv = np.mean(curvature)
+            result['left_turn'] = bool(mean_curv > 0.02)  # 1/m
+            result['right_turn'] = bool(mean_curv < -0.02)
+
+            # 3. U-turn detection (cumulative heading change)
+            if 'vx' in ego_df.columns and 'timestamp' in ego_df.columns:
+                vx = ego_df['vx'].values
+                timestamps = ego_df['timestamp'].values
+                if len(timestamps) > 1:
+                    dt = np.diff(timestamps) / 1e6  # Convert to seconds
+                    heading_change = np.sum(np.abs(curvature[:-1] * vx[:-1] * dt))
+                    result['u_turn'] = bool(heading_change > np.deg2rad(150))  # >150 degrees
+
+        # 4. Lane change/overtake detection (vy pattern)
+        if 'vy' in ego_df.columns:
+            vy = ego_df['vy'].values
+            # Detect if lateral velocity has significant positive and negative values
+            vy_positive = np.sum(vy > 0.5)
+            vy_negative = np.sum(vy < -0.5)
+            result['lane_change'] = bool(vy_positive > 5 and vy_negative > 5)
+
+    except Exception as e:
+        print(f"[ANALYZE] Error analyzing egomotion: {e}")
+
+    return result
+
+
+def filter_clips_by_scenario(
+    scenarios: List[str],
+    split: str = "val",
+    max_clips: int = 20
+) -> Tuple[List[str], str]:
+    """
+    Filter clips by selected driving scenarios.
+
+    Args:
+        scenarios: List of selected scenario names
+        split: Dataset split (train/val/test/all)
+        max_clips: Maximum number of clips to find
+
+    Returns:
+        (matched_clip_ids, status_message)
+    """
+    from huggingface_hub import hf_hub_download
+    import pandas as pd
+    import zipfile
+    import tempfile
+    import random
+
+    token = get_hf_token()
+    if not token:
+        return [], "HF_TOKEN required for Official dataset access"
+
+    # Map scenario display names to detection keys
+    scenario_map = {
+        "Sudden Acceleration": "sudden_acceleration",
+        "Hard Braking": "hard_braking",
+        "Left Turn": "left_turn",
+        "Right Turn": "right_turn",
+        "U-Turn": "u_turn",
+        "Lane Change / Overtake": "lane_change"
+    }
+
+    target_flags = [scenario_map[s] for s in scenarios if s in scenario_map]
+    if not target_flags:
+        return [], "Please select at least one scenario"
+
+    try:
+        # 1. Load clip_index
+        print("[FILTER] Loading clip_index.parquet...")
+        index_path = hf_hub_download(
+            repo_id=OFFICIAL_REPO_ID,
+            filename="clip_index.parquet",
+            repo_type="dataset",
+            token=token
+        )
+        index_df = pd.read_parquet(index_path)
+
+        # 2. Filter by split
+        if split != "all":
+            index_df = index_df[index_df['split'] == split]
+
+        # Filter valid clips
+        index_df = index_df[index_df['clip_is_valid'] == True]
+
+        print(f"[FILTER] Found {len(index_df)} valid clips in {split} split")
+
+        # 3. Random sample and scan
+        clip_ids = list(index_df.index)
+        random.shuffle(clip_ids)
+
+        matched = []
+        scanned = 0
+        errors = 0
+
+        # Group clips by chunk to minimize zip downloads
+        chunk_clips = {}
+        for clip_id in clip_ids[:max_clips * 5]:  # Sample more to find enough matches
+            chunk = int(index_df.loc[clip_id, 'chunk'])
+            if chunk not in chunk_clips:
+                chunk_clips[chunk] = []
+            chunk_clips[chunk].append(clip_id)
+
+        for chunk, clips_in_chunk in chunk_clips.items():
+            if len(matched) >= max_clips:
+                break
+
+            try:
+                # Download egomotion zip for this chunk (cached)
+                ego_filename = f"labels/egomotion/egomotion.chunk_{chunk:04d}.zip"
+                print(f"[FILTER] Checking chunk {chunk} ({len(clips_in_chunk)} clips)...")
+
+                ego_zip_path = hf_hub_download(
+                    repo_id=OFFICIAL_REPO_ID,
+                    filename=ego_filename,
+                    repo_type="dataset",
+                    token=token
+                )
+
+                with zipfile.ZipFile(ego_zip_path, 'r') as zf:
+                    for clip_id in clips_in_chunk:
+                        if len(matched) >= max_clips:
+                            break
+
+                        ego_parquet = f"{clip_id}.egomotion.parquet"
+                        if ego_parquet in zf.namelist():
+                            with tempfile.TemporaryDirectory() as tmpdir:
+                                zf.extract(ego_parquet, tmpdir)
+                                ego_df = pd.read_parquet(f"{tmpdir}/{ego_parquet}")
+
+                                # Analyze
+                                flags = analyze_egomotion(ego_df)
+
+                                # Check if matches any target scenario
+                                if any(flags.get(f, False) for f in target_flags):
+                                    matched.append(clip_id)
+                                    print(f"[FILTER] Found match: {clip_id[:8]}...")
+
+                        scanned += 1
+
+            except Exception as e:
+                print(f"[FILTER] Error with chunk {chunk}: {e}")
+                errors += 1
+                continue
+
+        status = f"Found {len(matched)} clips (scanned {scanned}, {errors} errors)"
+        return matched, status
+
+    except Exception as e:
+        return [], f"Error: {str(e)[:100]}"
+
+
 def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any]:
     """
     Download images from Official dataset for a specific clip_id.
@@ -1872,12 +2065,54 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
             # Official mode specific inputs
             with gr.Group(visible=False) as official_group:
                 gr.Markdown("#### Official Mode Settings")
-                gr.Markdown("⚠️ **Step 1**: Enter clip_id → **Step 2**: Prepare Data → **Step 3**: Run Inference")
+
+                # Clip Filtering Section
+                gr.Markdown("##### Clip Filtering (Egomotion-based)")
+                gr.Markdown("*Note: Country/weather/time metadata is not available in dataset*")
+
+                scenario_filter = gr.CheckboxGroup(
+                    choices=[
+                        "Sudden Acceleration",
+                        "Hard Braking",
+                        "Left Turn",
+                        "Right Turn",
+                        "U-Turn",
+                        "Lane Change / Overtake"
+                    ],
+                    label="Select Driving Scenarios",
+                    value=[],
+                    info="Check scenarios to filter clips by"
+                )
+
+                with gr.Row():
+                    split_filter = gr.Dropdown(
+                        choices=["val", "train", "test", "all"],
+                        value="val",
+                        label="Dataset Split"
+                    )
+                    max_clips_slider = gr.Slider(
+                        minimum=5, maximum=50, value=10, step=5,
+                        label="Max Clips to Find"
+                    )
+
+                filter_btn = gr.Button("Search Clips", variant="secondary")
+
+                filtered_clips_dropdown = gr.Dropdown(
+                    choices=[],
+                    label="Filtered Clips (select to use)",
+                    interactive=True,
+                    info="Matching clip_ids will appear here"
+                )
+                filter_status = gr.Markdown(value="Select scenarios and click 'Search Clips'")
+
+                gr.Markdown("---")
+                gr.Markdown("**Step 1**: Enter clip_id → **Step 2**: Prepare Data → **Step 3**: Run Inference")
+
                 clip_id_input = gr.Textbox(
                     label="Clip ID (UUID)",
                     placeholder="e.g., 030c760c-ae38-49aa-9ad8-f5650a545d26",
                     value="",
-                    info="Enter a valid clip_id from PhysicalAI-AV dataset"
+                    info="Enter a valid clip_id or select from filtered list above"
                 )
                 t0_us_input = gr.Number(
                     label="t0 (microseconds)",
@@ -1885,7 +2120,7 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                     precision=0,
                     info="Timestamp for trajectory prediction start"
                 )
-                prepare_official_btn = gr.Button("📥 Prepare Official Data (downloads ~4GB)", variant="secondary", size="lg")
+                prepare_official_btn = gr.Button("Prepare Official Data (downloads ~4GB)", variant="secondary", size="lg")
                 official_data_status = gr.Markdown(value="No Official data prepared.")
 
                 # Image preview for Official mode
@@ -1965,6 +2200,36 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
         fn=on_mode_change,
         inputs=[inference_mode],
         outputs=[official_group, demo_mode_cb, minade_output, metric_status]
+    )
+
+    # Clip filtering event handlers
+    def on_filter_clips(scenarios, split, max_clips):
+        """Handle filter button click."""
+        if not scenarios:
+            return gr.update(choices=[]), "Please select at least one scenario"
+
+        matched, status = filter_clips_by_scenario(scenarios, split, int(max_clips))
+
+        if matched:
+            # Update dropdown with matched clips
+            return gr.update(choices=matched, value=matched[0]), f"✅ {status}"
+        else:
+            return gr.update(choices=[]), f"⚠️ {status}"
+
+    filter_btn.click(
+        fn=on_filter_clips,
+        inputs=[scenario_filter, split_filter, max_clips_slider],
+        outputs=[filtered_clips_dropdown, filter_status]
+    )
+
+    def on_select_filtered_clip(selected):
+        """Auto-fill clip_id when user selects from filtered list."""
+        return selected if selected else ""
+
+    filtered_clips_dropdown.change(
+        fn=on_select_filtered_clip,
+        inputs=[filtered_clips_dropdown],
+        outputs=[clip_id_input]
     )
 
     def on_prepare_sample(source, sample_pool, sample_idx):
