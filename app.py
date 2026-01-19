@@ -328,12 +328,12 @@ def fetch_official_images(clip_id: str, t0_us: float = 5100000) -> Dict[str, Any
         print(f"[OFFICIAL] Found clip in chunk {chunk}")
 
         # Step 2: Download zip files and extract videos
-        # Camera mapping for Alpamayo (4 cameras)
+        # Camera mapping for Alpamayo (4 cameras) - matches CAMERAS global
         camera_names = {
             'front_wide': 'camera_front_wide_120fov',
+            'front_tele': 'camera_front_tele_30fov',
             'cross_left': 'camera_cross_left_120fov',
-            'cross_right': 'camera_cross_right_120fov',
-            'rear_tele': 'camera_rear_tele_30fov'
+            'cross_right': 'camera_cross_right_120fov'
         }
 
         all_images = []
@@ -2042,8 +2042,8 @@ with gr.Blocks(title="Alpamayo-R1-10B Inference Demo", theme=gr.themes.Soft()) a
                 # Prepare gallery images (first frame from each camera)
                 camera_images = official_images['camera_images']
                 gallery_images = []
-                cam_labels = ['Front Wide', 'Cross Left', 'Cross Right', 'Rear Tele']
-                cam_keys = ['front_wide', 'cross_left', 'cross_right', 'rear_tele']
+                cam_labels = ['Front Wide', 'Front Tele', 'Cross Left', 'Cross Right']
+                cam_keys = ['front_wide', 'front_tele', 'cross_left', 'cross_right']
                 for i, cam_key in enumerate(cam_keys):
                     if cam_key in camera_images and camera_images[cam_key]:
                         img = camera_images[cam_key][0]  # First frame
